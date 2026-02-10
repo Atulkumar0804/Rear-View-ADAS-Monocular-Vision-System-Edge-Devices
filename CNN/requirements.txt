@@ -1,7 +1,7 @@
 torch>=2.0.0
 torchvision>=0.15.0
 opencv-python>=4.8.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 scikit-learn>=1.3.0
@@ -9,3 +9,11 @@ tqdm>=4.65.0
 Pillow>=10.0.0
 ultralytics>=8.0.0
 streamlit>=1.28.0
+flask>=3.0.0
+transformers>=4.30.0
+huggingface_hub>=0.16.0
+timm>=0.9.0
+
+# Depth Pro - Apple's zero-shot metric depth model (no camera intrinsics needed)
+# Install with: pip install git+https://github.com/apple/ml-depth-pro.git
+# Or if you cloned the repo: pip install -e /path/to/ml-depth-pro

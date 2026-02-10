@@ -33,11 +33,6 @@ Run the main launcher:
 
 Or run scripts individually:
 
-**Web Interface (New!):**
-```bash
-streamlit run interface/app.py
-```
-
 **Camera Inference:**
 ```bash
 python inference/camera_inference.py --camera 0
@@ -47,15 +42,6 @@ python inference/camera_inference.py --camera 0
 ```bash
 python inference/video_inference.py --input video.mp4 --output result.mp4
 ```
-
-## 🐳 Docker Support
-
-Build and run the container:
-```bash
-docker build -t adas-cnn .
-docker run -p 8501:8501 --gpus all adas-cnn
-```
-Then open `http://localhost:8501` in your browser.
 
 ## 🧠 Pipeline Logic
 
