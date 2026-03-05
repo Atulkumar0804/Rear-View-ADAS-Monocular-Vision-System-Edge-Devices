@@ -16,16 +16,54 @@ import argparse
 from pathlib import Path
 import time
 import sys
+import threading
+from queue import Queue
+from collections import deque, defaultdict
 
 from ultralytics import YOLO
 
 # Get absolute path to YOLO model
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CNN_DIR = SCRIPT_DIR.parent
+sys.path.append(str(CNN_DIR))
+
+# Import ZoeDepth loader
+from scripts.zoedepth_loader import load_zoedepth_model
+
 # Use YOLOv11 from models folder
 YOLO_MODEL_PATH = str(CNN_DIR / "models/yolo/yolo11x-seg.pt")
 
-# Configuration
+
+# ============================================================================
+# KALMAN FILTER FOR DISTANCE SMOOTHING
+# ============================================================================
+
+class KalmanFilter1D:
+    """1D Kalman Filter for distance smoothing"""
+    
+    def __init__(self, process_variance=0.01, measurement_variance=0.1):
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        self.estimate = None
+        self.error_estimate = 1.0
+    
+    def update(self, measurement):
+        if self.estimate is None:
+            self.estimate = measurement
+            return measurement
+        
+        prediction = self.estimate
+        error_prediction = self.error_estimate + self.process_variance
+        kalman_gain = error_prediction / (error_prediction + self.measurement_variance)
+        self.estimate = prediction + kalman_gain * (measurement - prediction)
+        self.error_estimate = (1 - kalman_gain) * error_prediction
+        
+        return self.estimate
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 IMG_SIZE = (224, 224)
 CONFIDENCE_THRESHOLD = 0.4
 
@@ -104,33 +142,40 @@ transform = transforms.Compose([
 
 
 class VideoDetector:
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', zoedepth_interval=30):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
         print(f"🔥 Device: {self.device}")
-        
         # Load YOLO
         print("📦 Loading YOLO...")
         self.yolo = YOLO(YOLO_MODEL_PATH)
         print("✅ YOLO loaded")
-        
         # Load Fine-tuned Classifier
         CLASSIFIER_PATH = str(CNN_DIR / "models/classifier/weights/best.pt")
         print(f"📦 Loading Classifier: {CLASSIFIER_PATH}")
         self.classifier = YOLO(CLASSIFIER_PATH)
         print("✅ Classifier loaded")
-        
         # Tracking history for velocity estimation
         self.prev_distances = {}  # track_id -> [distances over time]
         self.track_id_counter = 0
         self.prev_boxes = []
-        # Track class history for smoothing (track_id -> deque of (class, conf))
-        from collections import deque, defaultdict
         self.track_classes = defaultdict(lambda: deque(maxlen=5))
-        # Minimum IoU to consider same track (increase to reduce ID switches)
         self.IOU_THRESHOLD = 0.45
-        # Minimum crop area to run CNN classification (avoid tiny noisy crops)
         self.MIN_CROP_AREA = 64 * 64  # pixels
+        # Dual-depth system
+        print("📦 Loading ZoeDepth (ZoeD_K)...")
+        try:
+            self.zoedepth_model = load_zoedepth_model("ZoeD_K", device=str(self.device))
+            print("✅ ZoeDepth (ZoeD_K) loaded successfully!")
+        except Exception as e:
+            print(f"❌ Failed to load ZoeDepth: {e}")
+            self.zoedepth_model = None
+        self.zoedepth_interval = zoedepth_interval
+        self.zoedepth_frame_counter = 0
+        self.last_zoedepth_depth = None
+        self.zoedepth_corrections = {}
+        self.classical_depth_scale = 1.0
+        self.ema_alpha = 0.3
+        self.kalman_filters = defaultdict(lambda: KalmanFilter1D())
     
     def match_detections(self, current_boxes, prev_boxes, iou_threshold=0.3):
         """Match current detections with previous ones using IoU"""
@@ -214,30 +259,21 @@ class VideoDetector:
             return "stable"
     
     def detect_frame(self, frame):
-        """Detect vehicles in a single frame with tracking"""
+        """Detect vehicles in a single frame with tracking and dual-depth correction"""
         results = []
         current_boxes_raw = []
-        
         # YOLO detection
         yolo_results = self.yolo(frame, verbose=False)[0]
-        
         for i, detection in enumerate(yolo_results.boxes.data):
             x1, y1, x2, y2, conf, cls_id = detection.cpu().numpy()
             cls_id = int(cls_id)
-            
-            # Get mask if available
             mask = None
             if yolo_results.masks is not None:
-                # masks.xy is a list of arrays, one for each detection
                 if i < len(yolo_results.masks.xy):
                     mask = yolo_results.masks.xy[i]
-            
             if cls_id not in YOLO_CLASS_MAPPING:
                 continue
-            
             yolo_class = YOLO_CLASS_MAPPING[cls_id]
-            
-            # For Person, Bicycle, and Two-wheeler, trust YOLO (excluded from secondary classifier)
             if yolo_class in ['Person', 'Bicycle', 'Two-wheeler']:
                 if conf >= CONFIDENCE_THRESHOLD:
                     current_boxes_raw.append([int(x1), int(y1), int(x2), int(y2)])
@@ -249,41 +285,27 @@ class VideoDetector:
                         'mask': mask
                     })
                 continue
-            
-            # For vehicles, refine with Fine-tuned Classifier
             if conf >= CONFIDENCE_THRESHOLD:
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                
-                # Default to YOLO class
                 final_class = yolo_class
                 final_conf = float(conf)
                 source = 'YOLO'
-                
-                # Crop vehicle for classification
                 crop = frame[y1:y2, x1:x2]
-                
                 if crop.size > 0:
                     crop_area = crop.shape[0] * crop.shape[1]
                     if crop_area >= self.MIN_CROP_AREA:
-                        # Run classifier
-                        # YOLO classifier expects PIL or numpy array
                         try:
                             cls_results = self.classifier(crop, verbose=False)
                             if cls_results and len(cls_results) > 0:
                                 top1 = cls_results[0].probs.top1
                                 top1_conf = cls_results[0].probs.top1conf.item()
-                                
-                                # Get class name from classifier names
                                 pred_class = cls_results[0].names[top1]
-                                
-                                # Trust classifier if confidence is decent
                                 if top1_conf > 0.4:
                                     final_class = pred_class
                                     final_conf = top1_conf
                                     source = 'YOLO_CLS'
                         except Exception as e:
                             print(f"Classifier error: {e}")
-
                 current_boxes_raw.append([x1, y1, x2, y2])
                 results.append({
                     'bbox': [x1, y1, x2, y2],
@@ -292,68 +314,89 @@ class VideoDetector:
                     'source': source,
                     'mask': mask
                 })
-        
-        # Merge overlapping riders and vehicles
         results = self.merge_rider_and_vehicle(results)
-        
-        # Rebuild current_boxes_raw after merging
         current_boxes_raw = [r['bbox'] for r in results]
-
-        # Match with previous detections for tracking (use slightly higher IOU)
         matches = self.match_detections(current_boxes_raw, self.prev_boxes, iou_threshold=self.IOU_THRESHOLD)
-        
+        # --- Dual-depth correction logic ---
+        self.zoedepth_frame_counter += 1
+        run_zoedepth = (self.zoedepth_frame_counter % self.zoedepth_interval == 0)
+        if run_zoedepth:
+            with torch.no_grad():
+                h, w = frame.shape[:2]
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                input_tensor = torch.from_numpy(rgb_frame).float().permute(2, 0, 1).unsqueeze(0).to(self.device) / 255.0
+                depth_output = self.zoedepth_model.infer(input_tensor)
+                if isinstance(depth_output, dict):
+                    depth_map = depth_output.get('metric_depth', depth_output.get('depth'))
+                else:
+                    depth_map = depth_output
+                if depth_map.shape[-2:] != (h, w):
+                    depth_map = torch.nn.functional.interpolate(
+                        depth_map.unsqueeze(0) if depth_map.dim() == 2 else depth_map,
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze()
+                self.last_zoedepth_depth = depth_map.cpu().numpy()
+        # Update correction factors if ZoeDepth ran
+        if self.last_zoedepth_depth is not None:
+            for det in results:
+                bbox = det['bbox']
+                class_name = det['class']
+                h_pixel = bbox[3] - bbox[1]
+                real_height = REAL_HEIGHTS.get(class_name, 1.5)
+                pinhole_depth = (real_height * FOCAL_LENGTH) / max(h_pixel, 1)
+                y1, y2 = max(0, int(bbox[1])), min(self.last_zoedepth_depth.shape[0], int(bbox[3]))
+                x1, x2 = max(0, int(bbox[0])), min(self.last_zoedepth_depth.shape[1], int(bbox[2]))
+                region = self.last_zoedepth_depth[y1:y2, x1:x2]
+                valid_depths = region[region > 0]
+                if len(valid_depths) > 10:
+                    ml_depth = np.median(valid_depths)
+                    if pinhole_depth > 0.1:
+                        correction = ml_depth / pinhole_depth
+                        if class_name in self.zoedepth_corrections:
+                            self.zoedepth_corrections[class_name] = self.ema_alpha * correction + (1 - self.ema_alpha) * self.zoedepth_corrections[class_name]
+                        else:
+                            self.zoedepth_corrections[class_name] = correction
+                        self.classical_depth_scale = self.ema_alpha * correction + (1 - self.ema_alpha) * self.classical_depth_scale
         # Assign track IDs and estimate motion
         for i, result in enumerate(results):
             bbox_height = result['bbox'][3] - result['bbox'][1]
-            distance = self.estimate_distance(bbox_height, result['class'])
-            
-            # Assign track ID
+            class_name = result['class']
+            real_height = REAL_HEIGHTS.get(class_name, 1.5)
+            pinhole_depth = (real_height * FOCAL_LENGTH) / max(bbox_height, 1)
+            correction_factor = self.zoedepth_corrections.get(class_name, self.classical_depth_scale)
+            corrected_depth = pinhole_depth * correction_factor
+            # Kalman filter smoothing
+            track_id = matches[i] if matches[i] != -1 else self.track_id_counter
             if matches[i] == -1:
-                # New detection
-                track_id = self.track_id_counter
                 self.track_id_counter += 1
-            else:
-                track_id = matches[i]
-            
+            smoothed_depth = self.kalman_filters[track_id].update(corrected_depth)
             result['track_id'] = track_id
-            result['distance'] = distance
-            
+            result['distance'] = smoothed_depth
             # Estimate motion
-            if distance:
-                motion = self.estimate_motion(track_id, distance)
+            if smoothed_depth:
+                motion = self.estimate_motion(track_id, smoothed_depth)
                 result['motion'] = motion
             else:
                 result['motion'] = "unknown"
-
             # --- Per-track class smoothing ---
-            # Maintain history of predicted classes for the track and compute weighted vote
             cls = result['class']
             conf_val = float(result.get('confidence', 0.0))
-            # append to history
             self.track_classes[track_id].append((cls, conf_val))
-
-            # Weighted vote across history
             votes = {}
             for c, cconf in self.track_classes[track_id]:
                 votes.setdefault(c, 0.0)
                 votes[c] += cconf
-
-            # Pick class with highest accumulated confidence
             if votes:
                 stable_class = max(votes.items(), key=lambda x: x[1])[0]
                 stable_conf = votes[stable_class] / len(self.track_classes[track_id])
-                
-                # If stable class differs from current but previous history strongly prefers previous, keep stable
-                # EXCEPTION: If current class is Person, trust it immediately to avoid delay in correction
                 if 'Person' in cls:
                     result['class'] = cls
                 else:
                     result['class'] = stable_class
                     result['confidence'] = float(min(1.0, stable_conf))
-        
-        # Update prev_boxes for next frame
         self.prev_boxes = [{'bbox': r['bbox'], 'track_id': r['track_id']} for r in results]
-        
         return results
     
     def merge_rider_and_vehicle(self, results):

@@ -31,6 +31,7 @@ import json
 from queue import Queue
 import queue
 from collections import deque
+import math
 
 # Add scripts directory to path for ZoeDepth loader
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -97,6 +98,84 @@ try:
 except Exception as e:
     print(f"⚠️ Failed to load calibration data: {e}")
 
+
+# ============================================================================
+# REAR-CAMERA ADAS DOMAIN CONFIGURATION
+# Rear cameras are a DIFFERENT domain from front-facing highway cameras.
+# Key differences:
+#   - Ground dominates 60-70% of pixels (wide ground plane)
+#   - Pedestrians appear from the sides, not top-down
+#   - Close-range critical zone: 0.3m - 15m (not 0-100m highway)
+#   - Fisheye lens: extreme distortion at edges
+#   - Bumper occludes bottom ~8% of frame
+#   - Camera mounted low (0.5-1.0m) with downward tilt
+#   - Objects are very close before they become dangerous
+#
+# Dataset training pipeline (nuScenes → Waymo → Own data):
+#   Step 1: Pretrain on BDD100K (general road understanding, night/rain robustness)
+#   Step 2: Fine-tune on nuScenes CAM_BACK only (rear-camera geometry)
+#   Step 3: Fine-tune on Waymo (generalization, clean labels)
+#   Step 4: Collect 500-1000 frames from own rear camera (domain final fix)
+# ============================================================================
+
+REAR_CAMERA_CONFIG = {
+    # ---- Geometry ----
+    "mounting_height_m": 0.75,       # Camera height above ground (meters)
+    "camera_tilt_deg": -15.0,        # Downward tilt of rear camera (degrees, negative = down)
+    "fisheye_fov_deg": 170.0,        # Typical rear fisheye FOV
+    "ground_plane_ratio": 0.65,      # Fraction of frame that is ground
+    "bumper_exclusion_ratio": 0.08,  # Bottom N% of frame is bumper (ignore detections here)
+
+    # ---- Critical Depth Zones (meters) ----
+    "zone_critical_m": 2.0,          # < 2m: CRITICAL - immediate brake
+    "zone_danger_m": 5.0,            # 2-5m: DANGER - slow down
+    "zone_caution_m": 10.0,          # 5-10m: CAUTION - be aware
+    "depth_clip_min_m": 0.3,         # Minimum sensible depth (rear camera)
+    "depth_clip_max_m": 15.0,        # Maximum relevant depth for reverse ADAS
+
+    # ---- Lateral Entry Detection (pedestrians from sides) ----
+    "side_entry_x_ratio": 0.15,      # Objects in left/right 15% = lateral entry
+    "side_entry_min_height_ratio": 0.05,  # Min height to register as lateral entry
+
+    # ---- Confidence thresholds (rear-camera tuned) ----
+    "confidence_critical_class": 0.35,    # Lower threshold for safety classes near camera
+    "confidence_general": 0.40,           # General confidence threshold
+}
+
+# ---- REAR-ADAS SAFETY CLASSES (5 classes only, as recommended) ----
+# Do NOT train 80 COCO classes. Rear ADAS needs RELIABLE safety detection.
+# Train only: car, pedestrian, bicycle, motorcycle, static obstacle
+SAFETY_CLASSES = {
+    'Person',           # Pedestrian - highest priority
+    'Bicycle',          # Cyclist
+    'Two-wheeler',      # Motorcycle / Scooter
+    'Sedan',            # Generic car
+    'Hatchback',        # Generic car variant
+    'SUV',              # SUV
+    'Bus',              # Large vehicle
+    'Truck',            # Large vehicle
+    'Three-wheeler',    # Auto-rickshaw (common in India)
+    'LCV',              # Light commercial vehicle
+    'Van',              # Van
+    'MUV',              # Multi-utility vehicle
+    # Merged rider+vehicle classes
+    'Person + Two-wheeler',
+    'Person + Bicycle',
+    'Person + Three-wheeler',
+    # Static obstacles (nuScenes: barrier, cone)
+    'Others',           # Catch-all for static obstacles
+}
+
+# Classes that should NEVER be shown in rear-camera ADAS (noise reduction)
+IGNORE_CLASSES_REAR = set()  # Currently empty - all SAFETY_CLASSES are relevant
+
+# Alert zone colors (BGR) - designed for rear-view overlay
+ALERT_ZONE_COLORS = {
+    'CRITICAL': (0, 0, 255),      # Red - < 2m
+    'DANGER':   (0, 80, 255),     # Orange-Red - 2-5m
+    'CAUTION':  (0, 165, 255),    # Orange - 5-10m
+    'SAFE':     (0, 200, 0),      # Green - > 10m
+}
 
 # ============================================================================
 # MERGED CLASSES - Consolidated from separate modules
@@ -710,6 +789,399 @@ transform = transforms.Compose([
 ])
 
 
+# ============================================================================
+# REAR-CAMERA DOMAIN ADAPTER
+# Handles the unique geometry and appearance challenges of a reversing camera
+# that differ fundamentally from front-facing highway datasets.
+# ============================================================================
+
+class RearCameraDomainAdapter:
+    """
+    Adapts inference for rear-camera / reversing-camera domain.
+
+    Key adaptations vs. front-camera:
+    ─────────────────────────────────
+    1. Ground-dominance reweighting  – Ground takes 60-70% of pixels.
+       Depth maps must be re-anchored to the ground plane, not infinity.
+    2. Bumper exclusion zone         – Bottom N% of frame is the car's own
+       bumper.  Detections in this strip are invalid and are suppressed.
+    3. Lateral (side-entry) detection – Pedestrians enter from the LEFT/RIGHT
+       edges of the frame, not from the top or centre as in front cameras.
+       We flag detections in the outer 15% columns as "lateral entry".
+    4. Fisheye barrel-distortion correction – Rear cameras typically have
+       170° FOV.  Objects at the edges are geometrically stretched; their
+       bounding-box heights under-estimate their true pixel height, causing
+       the pinhole formula to over-estimate distance.  We apply a radial
+       correction factor to compensate.
+    5. Close-range depth clipping     – Relevant range for reverse ADAS is
+       0.3 m – 15 m.  Anything beyond 15 m is NOT a reversing hazard.
+    6. Ground-plane distance fallback – When ZoeDepth returns a depth that
+       is unrealistically large (> 15 m) for a large bounding box, we fall
+       back to a ground-contact point estimate.
+
+    Dataset domain notes
+    ────────────────────
+    • nuScenes CAM_BACK / CAM_BACK_LEFT / CAM_BACK_RIGHT  ← primary source
+    • Waymo (surround cameras)                             ← generalisation
+    • BDD100K                                              ← night/rain robustness
+    • Own rear-camera frames (500-1000)                   ← final domain fix
+    """
+
+    def __init__(self, config: dict = None, frame_width: int = 640,
+                 frame_height: int = 480):
+        self.cfg = config or REAR_CAMERA_CONFIG
+        self.W = frame_width
+        self.H = frame_height
+
+        self._bumper_y = int(self.H * (1.0 - self.cfg["bumper_exclusion_ratio"]))
+        self._side_x_left  = int(self.W * self.cfg["side_entry_x_ratio"])
+        self._side_x_right = int(self.W * (1.0 - self.cfg["side_entry_x_ratio"]))
+
+        # Pre-compute fisheye radial correction LUT (fast per-frame lookup)
+        self._fisheye_lut = self._build_fisheye_lut(self.W, self.H,
+                                                     self.cfg["fisheye_fov_deg"])
+        print(f"✅ RearCameraDomainAdapter ready  "
+              f"[bumper_y={self._bumper_y}px | "
+              f"side_x={self._side_x_left}-{self._side_x_right}px | "
+              f"depth_clip={self.cfg['depth_clip_min_m']}-"
+              f"{self.cfg['depth_clip_max_m']}m]")
+
+    # ------------------------------------------------------------------ #
+    #  Frame preprocessing                                                 #
+    # ------------------------------------------------------------------ #
+    def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply any frame-level pre-processing needed for rear-camera domain.
+        Currently: mild CLAHE enhancement on the lower half (ground area)
+        to improve detection of dark objects on asphalt.
+        """
+        processed = frame.copy()
+        lab = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB)
+        l_channel, a, b = cv2.split(lab)
+        # Apply CLAHE only to bottom 70% (ground-dominated region)
+        ground_start = int(self.H * 0.30)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_channel[ground_start:] = clahe.apply(l_channel[ground_start:])
+        lab = cv2.merge([l_channel, a, b])
+        processed = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        return processed
+
+    # ------------------------------------------------------------------ #
+    #  Bumper exclusion                                                    #
+    # ------------------------------------------------------------------ #
+    def is_in_bumper_zone(self, bbox: list) -> bool:
+        """
+        Returns True if the detection bbox is inside the bumper exclusion zone.
+        These detections are caused by the vehicle's own bumper / body and
+        must be suppressed to avoid false alarms at distance 0.
+        """
+        x1, y1, x2, y2 = bbox
+        # If more than 60% of the box height is below the bumper line → discard
+        box_h = max(1, y2 - y1)
+        overlap = max(0, y2 - self._bumper_y)
+        return (overlap / box_h) > 0.60
+
+    # ------------------------------------------------------------------ #
+    #  Lateral (side-entry) detection                                     #
+    # ------------------------------------------------------------------ #
+    def get_entry_side(self, bbox: list) -> str:
+        """
+        Detect if an object is entering the scene laterally (from left/right edge).
+        This is typical for pedestrians stepping off the kerb when reversing.
+        Returns: 'left', 'right', or 'center'
+        """
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2
+        box_h = max(1, y2 - y1)
+        min_h = self.H * self.cfg["side_entry_min_height_ratio"]
+        if box_h < min_h:
+            return 'center'
+        if cx < self._side_x_left:
+            return 'left'
+        if cx > self._side_x_right:
+            return 'right'
+        return 'center'
+
+    # ------------------------------------------------------------------ #
+    #  Fisheye height correction                                          #
+    # ------------------------------------------------------------------ #
+    def _build_fisheye_lut(self, W: int, H: int, fov_deg: float) -> np.ndarray:
+        """
+        Build a 2-D array (H × W) of multiplicative correction factors.
+        At the image centre the factor is 1.0.  At the edges it is > 1.0
+        to compensate for the barrel distortion that shrinks the apparent
+        height of objects near the frame edge.
+        
+        We model the fisheye with the equidistant projection:
+            r_px = f_fish · θ   where θ is the angle from optical axis.
+        For a rectilinear (pinhole) camera the same object would have
+            r_px_rect = f_rect · tan(θ)
+        The height correction factor is  tan(θ) / θ  (always ≥ 1).
+        """
+        half_fov_rad = math.radians(fov_deg / 2.0)
+        cx, cy = W / 2.0, H / 2.0
+        # Normalised radial distance in fisheye image (0 = centre, 1 = edge)
+        ys, xs = np.mgrid[0:H, 0:W]
+        r_px = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+        r_max = math.sqrt(cx ** 2 + cy ** 2)
+        r_norm = np.clip(r_px / r_max, 0.0, 1.0)
+        # Map normalised radius to angle
+        theta = r_norm * half_fov_rad
+        # Correction factor: tan(θ)/θ  (= 1 at centre; >1 at edges)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            factor = np.where(theta < 1e-6, 1.0, np.tan(theta) / theta)
+        return factor.astype(np.float32)
+
+    def fisheye_correct_bbox_height(self, bbox: list) -> float:
+        """
+        Return a corrected pixel height for the bounding box that accounts
+        for fisheye compression at the image edges.
+        """
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        cy = (y1 + y2) // 2
+        cx = (x1 + x2) // 2
+        cy = np.clip(cy, 0, self.H - 1)
+        cx = np.clip(cx, 0, self.W - 1)
+        correction = float(self._fisheye_lut[cy, cx])
+        raw_h = max(1, y2 - y1)
+        return raw_h * correction
+
+    # ------------------------------------------------------------------ #
+    #  Depth map reweighting for ground dominance                         #
+    # ------------------------------------------------------------------ #
+    def reweight_depth_map(self, depth_map: np.ndarray) -> np.ndarray:
+        """
+        In a rear-view camera the ground plane dominates 60-70% of pixels.
+        The ZoeDepth model (trained on general scenes) often assigns very
+        large depth values to the ground, pulling the per-frame average up.
+        We re-anchor the depth map by normalising the ground strip
+        separately from the sky/upper strip.
+        """
+        if depth_map is None:
+            return depth_map
+        h = depth_map.shape[0]
+        ground_start = int(h * (1.0 - self.cfg["ground_plane_ratio"]))
+        result = depth_map.copy()
+        # Clip to rear-camera relevant range globally
+        result = np.clip(result,
+                         self.cfg["depth_clip_min_m"],
+                         self.cfg["depth_clip_max_m"])
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  Ground-contact distance estimation                                  #
+    # ------------------------------------------------------------------ #
+    def ground_contact_distance(self, bbox: list, mounting_height: float,
+                                focal_length: float) -> float:
+        """
+        Estimate distance from the ground contact point of the bounding box.
+        Uses the inverse pinhole model applied to the Y coordinate of the
+        bottom edge of the detection box.
+
+        Distance ≈ mounting_height × focal_length / (y_bottom - y_horizon)
+
+        Where y_horizon ≈ H × (1 - ground_plane_ratio).
+        """
+        x1, y1, x2, y2 = bbox
+        y_horizon = self.H * (1.0 - self.cfg["ground_plane_ratio"])
+        y_contact = y2  # bottom edge of bbox = ground contact
+        delta_y = max(1, y_contact - y_horizon)
+        distance = (mounting_height * focal_length) / delta_y
+        return float(np.clip(distance,
+                              self.cfg["depth_clip_min_m"],
+                              self.cfg["depth_clip_max_m"]))
+
+    # ------------------------------------------------------------------ #
+    #  Filter & annotate a list of detections                             #
+    # ------------------------------------------------------------------ #
+    def filter_detections(self, detections: list, frame_w: int,
+                           frame_h: int) -> list:
+        """
+        Apply all rear-camera filters to a detection list.
+        Returns filtered list with extra keys:
+            'rear_filtered'  – True if the detection was removed
+            'entry_side'     – 'left' | 'right' | 'center'
+            'in_bumper_zone' – True if inside bumper exclusion strip
+        """
+        self.W = frame_w
+        self.H = frame_h
+        self._bumper_y = int(frame_h * (1.0 - self.cfg["bumper_exclusion_ratio"]))
+        self._side_x_left  = int(frame_w * self.cfg["side_entry_x_ratio"])
+        self._side_x_right = int(frame_w * (1.0 - self.cfg["side_entry_x_ratio"]))
+
+        filtered = []
+        for det in detections:
+            bbox = det['bbox']
+            in_bumper = self.is_in_bumper_zone(bbox)
+            entry_side = self.get_entry_side(bbox)
+
+            det = dict(det)  # shallow copy – do not mutate original
+            det['in_bumper_zone'] = in_bumper
+            det['entry_side'] = entry_side
+
+            if in_bumper:
+                # Suppressed – still pass along with flag so HUD can mark it
+                det['rear_filtered'] = True
+            else:
+                det['rear_filtered'] = False
+
+            filtered.append(det)
+
+        return filtered
+
+
+# ============================================================================
+# REAR-ADAS ALERT SYSTEM
+# Implements the three proximity zones recommended for reverse-collision warning.
+# ============================================================================
+
+class RearADASAlert:
+    """
+    Three-zone proximity alert system for rear-camera ADAS.
+
+    Zone definitions (configurable):
+        CRITICAL  < 2 m   – Immediate brake / stop
+        DANGER    2 – 5 m – Slow down, audible rapid beep
+        CAUTION   5 –10 m – Awareness alert, slow beep
+        SAFE      > 10 m  – No alert
+
+    Alert is triggered per-object per-frame; deduplication / throttling
+    is handled by a cooldown timer so the system does not spam.
+
+    Audio alerts use a platform-agnostic beep stub.  Replace the body of
+    `_emit_audio_alert()` with your hardware beeper call.
+    """
+
+    ZONES = [
+        ('CRITICAL', 0.0,  2.0,  (0,   0,   255), 3),   # (name, min, max, bgr, beep_hz_factor)
+        ('DANGER',   2.0,  5.0,  (0,   80,  255), 2),
+        ('CAUTION',  5.0, 10.0,  (0,  165,  255), 1),
+        ('SAFE',    10.0, 999.0, (0,  200,    0), 0),
+    ]
+
+    def __init__(self, cooldown_s: float = 0.5):
+        self.cooldown_s = cooldown_s
+        self._last_alert_time: dict = {}   # track_id → last alert timestamp
+        self._last_zone: dict = {}         # track_id → last zone name
+        self.alert_log: deque = deque(maxlen=100)
+        self._critical_active = False
+
+    def classify_zone(self, distance: float) -> tuple:
+        """Return (zone_name, color_bgr) for a given distance in metres."""
+        for name, dmin, dmax, color, _ in self.ZONES:
+            if dmin <= distance < dmax:
+                return name, color
+        return 'SAFE', (0, 200, 0)
+
+    def process(self, detections: list) -> list:
+        """
+        Process a list of detections, add 'alert_zone' and 'alert_color' keys.
+        Trigger audio alerts for new critical/danger events.
+        Returns the annotated detection list.
+        """
+        self._critical_active = False
+        now = time.time()
+
+        for det in detections:
+            if det.get('rear_filtered', False):
+                det['alert_zone'] = 'SUPPRESSED'
+                det['alert_color'] = (80, 80, 80)
+                continue
+
+            dist = det.get('distance')
+            if dist is None:
+                det['alert_zone'] = 'UNKNOWN'
+                det['alert_color'] = (128, 128, 128)
+                continue
+
+            zone_name, color = self.classify_zone(float(dist))
+            det['alert_zone'] = zone_name
+            det['alert_color'] = color
+
+            if zone_name == 'CRITICAL':
+                self._critical_active = True
+
+            # Throttle alerts by track_id
+            track_id = det.get('track_id', -1)
+            last_t = self._last_alert_time.get(track_id, 0.0)
+            last_zone = self._last_zone.get(track_id, 'SAFE')
+
+            # Fire if zone worsened or cooldown expired
+            if zone_name in ('CRITICAL', 'DANGER') and (
+                zone_name != last_zone or (now - last_t) > self.cooldown_s
+            ):
+                self._emit_audio_alert(zone_name, dist)
+                self._last_alert_time[track_id] = now
+                self._last_zone[track_id] = zone_name
+                self.alert_log.append({
+                    'time': now,
+                    'track_id': track_id,
+                    'zone': zone_name,
+                    'class': det.get('class', '?'),
+                    'distance': dist,
+                    'entry_side': det.get('entry_side', 'center')
+                })
+
+        return detections
+
+    @property
+    def critical_active(self) -> bool:
+        return self._critical_active
+
+    def _emit_audio_alert(self, zone: str, distance: float):
+        """
+        Stub for audio alert output.
+        Replace this method body with your hardware beeper / TTS call.
+        On Linux you can use:  os.system("beep -f 1000 -l 200")
+        """
+        # Visual-only fallback: print to terminal with colour codes
+        if zone == 'CRITICAL':
+            print(f"\033[1;31m⚠️  CRITICAL ALERT: Object at {distance:.1f}m – STOP!\033[0m")
+        elif zone == 'DANGER':
+            print(f"\033[1;33m⚠️  DANGER: Object at {distance:.1f}m – SLOW DOWN\033[0m")
+
+    def draw_alert_overlay(self, frame: np.ndarray, config: dict) -> np.ndarray:
+        """
+        Draw a rear-proximity arc guide at the bottom of the frame.
+        The arc shows the three zones (CRITICAL/DANGER/CAUTION) as
+        colour bands – standard in commercial reverse-camera displays.
+        """
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+
+        # Draw three concentric arc bands at bottom-centre
+        cx = w // 2
+        cy = h + int(h * 0.35)   # arc centre is below the frame bottom
+
+        zones_display = [
+            ('CAUTION',  int(w * 0.90), (0, 165, 255)),
+            ('DANGER',   int(w * 0.60), (0, 80, 255)),
+            ('CRITICAL', int(w * 0.35), (0, 0, 255)),
+        ]
+
+        for zone_name, radius, color in zones_display:
+            thickness = 4 if (zone_name == 'CRITICAL' and self._critical_active) else 2
+            cv2.ellipse(overlay, (cx, cy), (radius, radius),
+                        0, 200, 340, color, thickness)
+            # Zone label
+            label_angle = 270  # top of arc
+            lx = int(cx + radius * math.cos(math.radians(label_angle - 90)))
+            ly = int(cy + radius * math.sin(math.radians(label_angle - 90)))
+            ly = max(0, ly)
+            lx = max(10, min(w - 60, lx))
+            cv2.putText(overlay, zone_name, (lx - 30, ly + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+
+        # Flash entire frame border RED when CRITICAL
+        if self._critical_active:
+            border = 6
+            cv2.rectangle(overlay, (0, 0), (w - 1, h - 1), (0, 0, 255), border)
+
+        alpha = 0.55
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        return frame
+
+
 class DepthCalibrator:
     """
     Smart Hybrid Calibration for Monocular Depth Estimation.
@@ -780,22 +1252,44 @@ class DepthCalibrator:
 class CameraVehicleDetector:
     """Real-time camera-based vehicle detector"""
     
-    def __init__(self, model_path=None, device='cuda', use_tensorrt=False, fast_mode=False, hybrid_depth=False, focal_length=1000.0, zoedepth_interval=30):
+    def __init__(self, model_path=None, device='cuda', use_tensorrt=False,
+                 fast_mode=False, hybrid_depth=False, focal_length=1000.0,
+                 zoedepth_interval=30, rear_mode=False,
+                 mounting_height=None, rear_config: dict = None):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"🔥 Device: {self.device}")
-        
+
+        # ── Rear-camera ADAS mode ──────────────────────────────────────────
+        self.rear_mode = rear_mode
+        self.rear_adapter: RearCameraDomainAdapter | None = None
+        self.rear_alert: RearADASAlert | None = None
+        _rear_cfg = dict(REAR_CAMERA_CONFIG)
+        if rear_config:
+            _rear_cfg.update(rear_config)
+        if mounting_height is not None:
+            _rear_cfg["mounting_height_m"] = mounting_height
+        if self.rear_mode:
+            self.rear_adapter = RearCameraDomainAdapter(config=_rear_cfg)
+            self.rear_alert   = RearADASAlert(cooldown_s=0.5)
+            print("✅ Rear-camera ADAS mode ENABLED")
+            print(f"   Mounting height : {_rear_cfg['mounting_height_m']} m")
+            print(f"   Depth clip      : {_rear_cfg['depth_clip_min_m']} – "
+                  f"{_rear_cfg['depth_clip_max_m']} m")
+            print(f"   Bumper exclusion: bottom "
+                  f"{int(_rear_cfg['bumper_exclusion_ratio']*100)}% of frame")
+
         # Hybrid depth parameters
         self.use_hybrid = hybrid_depth
         self.focal_length = focal_length
         self.ml_model_name = "None"  # Track which ML model is active
         self.current_depth_method = "pinhole"  # Display current method
         self.zoedepth_interval = zoedepth_interval  # Run ZoeDepth every N frames
-        
+
         # Dual-depth system: Classical + ML correction
         self.classical_depth_scale = 1.0  # Correction factor from ZoeDepth
         self.last_zoedepth_correction_frame = 0
         self.zoedepth_corrections = {}  # Per-class correction factors
-        
+
         # Async processing queue for Depth Pro (keeps main thread free)
         self.depth_queue = Queue(maxsize=2)  # Only keep latest 2 frames
         self.depth_result_cache = {}  # Cache ML depth results
@@ -803,7 +1297,7 @@ class CameraVehicleDetector:
         self.ml_depth_running = False
         self.last_ml_depth_frame = None
         self.ml_depth_confidence = 0.0
-        
+
         # Optical Flow + PnP for distance correction
         self.prev_gray = None
         self.prev_detections = []
@@ -1237,54 +1731,69 @@ class CameraVehicleDetector:
         else:
             return "stable"
 
-    def estimate_distance(self, bbox_height, class_name, bbox_width=None):
-        """Estimate distance based on bounding box height with pose detection
-        
+    def estimate_distance(self, bbox_height, class_name, bbox_width=None,
+                          bbox: list = None):
+        """
+        Estimate distance based on bounding box height with pose detection.
+
+        Rear-camera domain adaptations applied here:
+          • Fisheye radial correction   – corrects edge-compressed bbox heights
+          • Close-range clip            – clips to [0.3 m, 15 m] for reverse ADAS
+          • CLASS_DEPTH_MULTIPLIERS     – class-specific empirical correction
+
         Args:
-            bbox_height: Height of bounding box in pixels
-            class_name: Object class name
-            bbox_width: Width of bounding box (optional, for pose detection)
+            bbox_height: Raw pixel height of bounding box
+            class_name:  Object class name
+            bbox_width:  Width of bounding box (optional, for pose detection)
+            bbox:        Full [x1,y1,x2,y2] bbox for fisheye correction (optional)
         """
         if bbox_height <= 0:
             return None
-        
+
+        # ── Fisheye correction (rear camera has barrel distortion) ──────────
+        # If we have the full bbox and a domain adapter, correct the apparent height.
+        corrected_height = float(bbox_height)
+        if bbox is not None and hasattr(self, 'rear_adapter') and self.rear_adapter is not None:
+            corrected_height = self.rear_adapter.fisheye_correct_bbox_height(bbox)
+
         # Get real-world height based on class
         real_height = REAL_HEIGHTS.get(class_name, 1.5)  # Default to car height
-        
+
         # POSE DETECTION FIX: Detect if person is sitting
         # Key insight: Sitting persons have different dimensions than standing
         if class_name == 'Person' and bbox_width is not None:
-            # Calculate aspect ratio (width/height)
-            aspect_ratio = bbox_width / bbox_height if bbox_height > 0 else 0
-            
-            # Standing person: aspect_ratio ≈ 0.4-0.5 (narrower)
-            # Sitting person: aspect_ratio ≈ 0.6-0.8 (wider, compact)
-            
-            if aspect_ratio > 0.65:  # Person is likely sitting
-                # Sitting person effective height (head + torso)
-                real_height = 0.85  # ~85cm average sitting person height
-            elif aspect_ratio > 0.55:  # Uncertain/crouching
-                real_height = 1.1  # Intermediate: crouching/bending
-            # else: standing (aspect_ratio < 0.55), use normal 1.7m
-        
-        elif class_name == 'Person' and bbox_width is None:
-            # Fallback: only bbox_height available
-            # Use height threshold as heuristic
-            if bbox_height < 80:  # Very short - likely sitting
+            aspect_ratio = bbox_width / corrected_height if corrected_height > 0 else 0
+            if aspect_ratio > 0.65:          # likely sitting
                 real_height = 0.85
-            elif bbox_height < 120:  # Medium - could be sitting or child
+            elif aspect_ratio > 0.55:        # crouching
+                real_height = 1.1
+        elif class_name == 'Person' and bbox_width is None:
+            if corrected_height < 80:
+                real_height = 0.85
+            elif corrected_height < 120:
                 real_height = 1.2
-        
+
         # Distance = (Real Height × Focal Length) / Pixel Height
-        distance = (real_height * FOCAL_LENGTH) / bbox_height
-        
+        distance = (real_height * FOCAL_LENGTH) / corrected_height
+
+        # Apply class-specific depth multiplier (empirical correction)
+        multiplier = CLASS_DEPTH_MULTIPLIERS.get(class_name, 1.0)
+        distance *= multiplier
+
+        # ── Rear-camera close-range clip ────────────────────────────────────
+        if hasattr(self, 'rear_mode') and self.rear_mode:
+            cfg = REAR_CAMERA_CONFIG
+            distance = float(np.clip(distance,
+                                     cfg["depth_clip_min_m"],
+                                     cfg["depth_clip_max_m"]))
+
         return distance
 
     def get_depth_map(self, frame, detections=None):
         """Get depth map (retrieves ZoeDepth results intermittently, not every frame)"""
         if not self.use_depth:
             return None
-        
+
         try:
             # DUAL-DEPTH SYSTEM: Check for new ZoeDepth results
             if self.use_hybrid and self.async_zoedepth is not None:
@@ -1300,15 +1809,18 @@ class CameraVehicleDetector:
                     self._zoedepth_update_count += 1
                     if self._zoedepth_update_count % 5 == 1:  # Print every 5th update
                         print(f"🔄 ZoeDepth updated (inference: {inference_time:.3f}s)")
-                
+
                 # Return last known depth map (could be from previous frame)
                 # Classical method will use this to compute corrections
                 if hasattr(self, 'ml_depth_map') and self.ml_depth_map is not None:
+                    # ── Rear-camera: reweight depth map to close-range ───
+                    if self.rear_mode and self.rear_adapter is not None:
+                        return self.rear_adapter.reweight_depth_map(self.ml_depth_map)
                     return self.ml_depth_map
                 else:
                     # No ZoeDepth data yet, return None (classical will run solo)
                     return None
-            
+
             # Use Hybrid Depth Switcher if available (legacy path)
             if self.use_hybrid and self.hybrid_depth_switcher is not None:
                 try:
@@ -1338,10 +1850,17 @@ class CameraVehicleDetector:
         """Detect vehicles in a single frame with tracking"""
         results = []
         current_boxes_raw = []
-        
+        h_frame, w_frame = frame.shape[:2]
+
+        # ── Rear-camera pre-processing ─────────────────────────────────────
+        # Apply CLAHE ground enhancement for better detection on dark asphalt
+        inference_frame = frame
+        if self.rear_mode and self.rear_adapter is not None:
+            inference_frame = self.rear_adapter.preprocess_frame(frame)
+
         # YOLO detection (run first to get detections for hybrid depth)
-        yolo_results = self.yolo(frame, verbose=False)[0]
-        
+        yolo_results = self.yolo(inference_frame, verbose=False)[0]
+
         # Prepare detections for hybrid depth (if using hybrid mode)
         detections_for_depth = []
         if self.use_hybrid:
@@ -1353,7 +1872,7 @@ class CameraVehicleDetector:
                         'bbox': [int(x1), int(y1), int(x2), int(y2)],
                         'class': YOLO_CLASS_MAPPING[cls_id]
                     })
-        
+
         # Request ZoeDepth update (runs intermittently, not every frame)
         # This runs in background while we process detections
         frame_id = int(time.time() * 1000) % 10000  # Frame timestamp ID
@@ -1479,19 +1998,23 @@ class CameraVehicleDetector:
                 self.track_id_counter += 1
             else:
                 track_id = matches[i]
-            
+
             result['track_id'] = track_id
-            
+
             # Default to pinhole (fallback) with pose-aware depth estimation
             bbox_width = result['bbox'][2] - result['bbox'][0]
-            distance = self.estimate_distance(bbox_height, result['class'], bbox_width=bbox_width)
+            distance = self.estimate_distance(
+                bbox_height, result['class'],
+                bbox_width=bbox_width,
+                bbox=result['bbox']   # pass full bbox for fisheye correction
+            )
             distance_metadata = {
-                'method': 'pinhole', 
+                'method': 'pinhole',
                 'confidence': 1.0,
                 'pinhole': distance,
                 'ml': None
             }
-            
+
             # Use hybrid depth blending if available
             if self.use_hybrid and self.ml_depth_thread and self.ml_depth_thread.is_alive():
                 hybrid_results = self.get_hybrid_depth_for_detections(frame, [result], frame_id)
@@ -1588,7 +2111,26 @@ class CameraVehicleDetector:
         # Cleanup old tracks from ADAS pipeline
         active_track_ids = [r['track_id'] for r in results]
         self.adas_pipeline.cleanup_old_tracks(active_track_ids)
-        
+
+        # ── Rear-camera domain filtering & alert system ────────────────────
+        if self.rear_mode and self.rear_adapter is not None:
+            # 1. Apply bumper exclusion + lateral-entry annotation
+            results = self.rear_adapter.filter_detections(results, w_frame, h_frame)
+
+            # 2. Reweight depth map to rear-camera range (if we have one)
+            # (done in get_depth_map via clip; kept here for future hooks)
+
+            # 3. For bumper-excluded detections, zero out distance so they
+            #    don't trigger false alerts
+            for r in results:
+                if r.get('rear_filtered', False):
+                    r['distance'] = None
+                    r['motion'] = 'suppressed'
+
+            # 4. Run three-zone alert system
+            if self.rear_alert is not None:
+                results = self.rear_alert.process(results)
+
         return results
     
     def merge_rider_and_vehicle(self, results):
@@ -1665,15 +2207,20 @@ class CameraVehicleDetector:
         return final_results
     
     def draw_detections(self, frame, detections, fps=None, debug=False):
-        """Draw bounding boxes with Depth Pro distance + COMPACT depth legend in corner"""
+        """Draw bounding boxes with depth distance + rear-ADAS HUD overlays"""
         annotated = frame.copy()
         h, w = frame.shape[:2]
-        
+
+        # ── Rear-camera arc proximity guide (drawn first, behind boxes) ────
+        if self.rear_mode and self.rear_alert is not None:
+            annotated = self.rear_alert.draw_alert_overlay(
+                annotated, REAR_CAMERA_CONFIG)
+
         # Collect all depth data for legend
         all_pinhole_depths = []
         all_ml_depths = []
         all_blended_depths = []
-        
+
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
             class_name = det['class']
@@ -1683,7 +2230,13 @@ class CameraVehicleDetector:
             distance_metadata = det.get('distance_metadata', {})
             pinhole_depth = distance_metadata.get('pinhole', None)
             ml_depth = distance_metadata.get('ml', None)
-            
+
+            # Rear-camera specific fields
+            rear_filtered   = det.get('rear_filtered', False)
+            entry_side      = det.get('entry_side', 'center')
+            alert_zone      = det.get('alert_zone', 'SAFE')
+            alert_color     = det.get('alert_color', (0, 200, 0))
+
             # Collect for legend
             if pinhole_depth is not None:
                 all_pinhole_depths.append(pinhole_depth)
@@ -1691,170 +2244,219 @@ class CameraVehicleDetector:
                 all_ml_depths.append(ml_depth)
             if distance is not None:
                 all_blended_depths.append(distance)
-            
+
             # Get base color for class
             color = CLASS_COLORS.get(class_name, (255, 255, 255))
-            
-            # Choose motion-based color for box border
-            motion_colors = {
-                'approaching': (0, 0, 255),    # Red - Warning!
-                'receding': (0, 255, 255),     # Yellow - Moving away
-                'stable': (0, 255, 0),         # Green - Safe
-                'unknown': color                # Default class color
-            }
-            box_color = motion_colors.get(motion, color)
-            
-            # Draw mask if available
+
+            # ── Box border colour logic ──────────────────────────────────
+            if self.rear_mode and not rear_filtered:
+                # Rear mode: use alert zone colour for box border
+                box_color = alert_color
+            elif rear_filtered:
+                box_color = (60, 60, 60)   # dim gray for suppressed bumper detections
+            else:
+                # Standard mode: motion-based
+                motion_colors = {
+                    'approaching': (0, 0, 255),
+                    'receding':    (0, 255, 255),
+                    'stable':      (0, 255, 0),
+                    'unknown':     color
+                }
+                box_color = motion_colors.get(motion, color)
+
+            # ── Draw segmentation mask ───────────────────────────────────
             mask = det.get('mask')
-            if mask is not None:
+            if mask is not None and not rear_filtered:
                 overlay = annotated.copy()
                 pts = mask.astype(np.int32)
-                cv2.fillPoly(overlay, [pts], color)
-                alpha = 0.4
+                cv2.fillPoly(overlay, [pts], alert_color if self.rear_mode else color)
+                alpha = 0.35
                 cv2.addWeighted(overlay, alpha, annotated, 1 - alpha, 0, annotated)
-            
-            # Draw box (thicker for better visibility)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
-            
-            # Draw LABEL: Class | Confidence | Distance
+
+            # ── Draw bounding box ────────────────────────────────────────
+            thickness = 1 if rear_filtered else 2
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, thickness)
+
+            # ── Build label ──────────────────────────────────────────────
             label_parts = [class_name, f"{confidence:.2f}"]
-            if distance is not None:
-                # Show corrected classical measurement
-                label_str = f"{distance:.1f}m"
-                # Add indicator showing dual-depth system status
+
+            if rear_filtered:
+                label_parts = [f"[BUMPER] {class_name}"]
+            elif distance is not None:
+                dist_str = f"{distance:.1f}m"
                 method = distance_metadata.get('method', '')
                 correction_factor = distance_metadata.get('correction_factor', 1.0)
-                
                 if 'ZoeDepth' in method:
-                    # Using ZoeDepth corrections
-                    label_str += f" (C:{correction_factor:.2f})"
+                    dist_str += f"(C:{correction_factor:.2f})"
                 elif 'ML' in method or ml_depth is not None:
-                    label_str += " (ML)"
-                
-                label_parts.append(label_str)
+                    dist_str += "(ML)"
+                # Rear-mode: append alert zone badge
+                if self.rear_mode:
+                    dist_str += f" [{alert_zone}]"
+                # Lateral entry badge
+                if self.rear_mode and entry_side in ('left', 'right'):
+                    dist_str += f" ◄{entry_side.upper()}►"
+                label_parts.append(dist_str)
+
             label = " | ".join(label_parts)
-            
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated, (x1, y1 - label_size[1] - 8), 
-                         (x1 + label_size[0] + 8, y1), box_color, -1)
-            cv2.putText(annotated, label, (x1 + 4, y1 - 4), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # ==================== COMPACT DEPTH LEGEND (TOP-LEFT CORNER - SMALL) ====================
+
+            label_size, _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(annotated,
+                          (x1, y1 - label_size[1] - 8),
+                          (x1 + label_size[0] + 8, y1),
+                          box_color, -1)
+            cv2.putText(annotated, label, (x1 + 4, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # ── CRITICAL flash: filled semi-transparent box ──────────────
+            if self.rear_mode and alert_zone == 'CRITICAL' and not rear_filtered:
+                flash = annotated.copy()
+                cv2.rectangle(flash, (x1, y1), (x2, y2), (0, 0, 255), -1)
+                cv2.addWeighted(flash, 0.20, annotated, 0.80, 0, annotated)
+
+        # ==================== COMPACT DEPTH LEGEND (TOP-LEFT CORNER) =======
         legend_x = 10
         legend_y = 20
         font_scale = 0.35
         line_height = 15
-        
-        # Build compact legend lines
+
         legend_lines = []
         legend_lines.append(f"FPS: {fps:.1f}" if fps else "FPS: --")
-        
-        # Show dual-depth system status
+
+        if self.rear_mode:
+            legend_lines.append("MODE: REAR-CAM ADAS")
+            # Count detections by alert zone
+            zone_counts = {}
+            for det in detections:
+                z = det.get('alert_zone', 'SAFE')
+                zone_counts[z] = zone_counts.get(z, 0) + 1
+            for zone_name in ('CRITICAL', 'DANGER', 'CAUTION', 'SAFE'):
+                cnt = zone_counts.get(zone_name, 0)
+                if cnt > 0:
+                    legend_lines.append(f"  {zone_name}: {cnt}")
+
         if all_ml_depths:
             avg_ml = np.mean(all_ml_depths)
             legend_lines.append(f"ZoeDepth: {avg_ml:.2f}m (GT)")
-        
         if all_pinhole_depths:
             avg_pinhole = np.mean(all_pinhole_depths)
             legend_lines.append(f"Classical: {avg_pinhole:.2f}m")
-        
         if all_blended_depths:
             avg_blended = np.mean(all_blended_depths)
             legend_lines.append(f"Corrected: {avg_blended:.2f}m")
-        
+
         legend_lines.append(f"Detections: {len(detections)}")
-        
-        # Calculate panel dimensions
-        max_label_width = max([cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] 
-                               for line in legend_lines])
+
+        max_label_width = max(
+            [cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX,
+                             font_scale, 1)[0][0] for line in legend_lines])
         panel_width = max_label_width + 15
         panel_height = len(legend_lines) * line_height + 8
-        
-        # Draw legend background panel (semi-transparent black)
+
         overlay = annotated.copy()
-        cv2.rectangle(overlay, (legend_x - 5, legend_y - 15), 
-                     (legend_x + panel_width, legend_y + panel_height - 10), 
-                     (0, 0, 0), -1)
+        cv2.rectangle(overlay,
+                      (legend_x - 5, legend_y - 15),
+                      (legend_x + panel_width, legend_y + panel_height - 10),
+                      (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
-        
-        # Draw border
-        cv2.rectangle(annotated, (legend_x - 5, legend_y - 15), 
-                     (legend_x + panel_width, legend_y + panel_height - 10), 
-                     (100, 150, 255), 1)
-        
-        # Draw legend text
+        cv2.rectangle(annotated,
+                      (legend_x - 5, legend_y - 15),
+                      (legend_x + panel_width, legend_y + panel_height - 10),
+                      (100, 150, 255), 1)
+
         current_y = legend_y
-        for i, line in enumerate(legend_lines):
-            # Color code different sections
-            if "ZoeDepth:" in line:
-                color = (0, 165, 255)  # Orange for ZoeDepth (ML ground truth)
+        for line in legend_lines:
+            if "REAR-CAM" in line:
+                color = (0, 220, 255)     # Bright cyan for mode badge
+            elif "CRITICAL" in line:
+                color = (0, 0, 255)
+            elif "DANGER" in line:
+                color = (0, 80, 255)
+            elif "CAUTION" in line:
+                color = (0, 165, 255)
+            elif "ZoeDepth:" in line:
+                color = (0, 165, 255)
             elif "Classical:" in line:
-                color = (0, 255, 255)  # Cyan for Classical pinhole
+                color = (0, 255, 255)
             elif "Corrected:" in line:
-                color = (147, 112, 219)  # Purple for corrected measurement
+                color = (147, 112, 219)
             elif "Detections:" in line:
-                color = (0, 255, 0)  # Green for detections count
+                color = (0, 255, 0)
             else:
-                color = (200, 200, 200)  # Gray for FPS
-            
-            cv2.putText(annotated, line, (legend_x + 3, current_y + 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
+                color = (200, 200, 200)
+
+            cv2.putText(annotated, line, (legend_x + 3, current_y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
             current_y += line_height
-        
-        # ==================== MOTION STATE LEGEND (TOP-RIGHT CORNER - SMALL) ====================
+
+        # ==================== MOTION STATE LEGEND (TOP-RIGHT) ==============
         if len(detections) > 0:
             motion_x = w - 180
             motion_y = 20
             motion_font_scale = 0.3
             motion_line_height = 14
-            
-            # Compact motion state legend
+
             motion_lines = [
                 "MOTION STATE:",
                 "R: Approaching",
                 "Y: Receding",
                 "G: Stable"
             ]
-            
-            # Calculate dimensions
-            motion_max_width = max([cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, motion_font_scale, 1)[0][0] 
-                                    for line in motion_lines])
+            if self.rear_mode:
+                motion_lines += ["─────────",
+                                 "ZONES:",
+                                 "RED <2m CRIT",
+                                 "ORG 2-5m DNGR",
+                                 "YLW 5-10m CAU"]
+
+            motion_max_width = max(
+                [cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX,
+                                 motion_font_scale, 1)[0][0]
+                 for line in motion_lines])
             motion_panel_width = motion_max_width + 15
             motion_panel_height = len(motion_lines) * motion_line_height + 8
-            
-            # Draw background
+
             overlay = annotated.copy()
-            cv2.rectangle(overlay, (motion_x - 5, motion_y - 15), 
-                         (w - 10, motion_y + motion_panel_height - 10), 
-                         (0, 0, 0), -1)
+            cv2.rectangle(overlay,
+                          (motion_x - 5, motion_y - 15),
+                          (w - 10, motion_y + motion_panel_height - 10),
+                          (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
-            
-            # Draw border
-            cv2.rectangle(annotated, (motion_x - 5, motion_y - 15), 
-                         (w - 10, motion_y + motion_panel_height - 10), 
-                         (100, 150, 255), 1)
-            
-            # Draw text
+            cv2.rectangle(annotated,
+                          (motion_x - 5, motion_y - 15),
+                          (w - 10, motion_y + motion_panel_height - 10),
+                          (100, 150, 255), 1)
+
             current_y = motion_y
             for line in motion_lines:
                 if "Approaching" in line:
-                    color = (0, 0, 255)  # Red
+                    color = (0, 0, 255)
                     display_line = "R: Approaching"
                 elif "Receding" in line:
-                    color = (0, 255, 255)  # Yellow/Cyan
+                    color = (0, 255, 255)
                     display_line = "Y: Receding"
                 elif "Stable" in line:
-                    color = (0, 255, 0)  # Green
+                    color = (0, 255, 0)
                     display_line = "G: Stable"
+                elif "CRIT" in line:
+                    color = (0, 0, 255)
+                    display_line = line
+                elif "DNGR" in line:
+                    color = (0, 80, 255)
+                    display_line = line
+                elif "CAU" in line:
+                    color = (0, 165, 255)
+                    display_line = line
                 else:
                     color = (200, 200, 200)
                     display_line = line
-                
-                cv2.putText(annotated, display_line, (motion_x, current_y + 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, motion_font_scale, color, 1)
+
+                cv2.putText(annotated, display_line,
+                            (motion_x, current_y + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, motion_font_scale, color, 1)
                 current_y += motion_line_height
-        
+
         return annotated
 
 
@@ -1864,10 +2466,10 @@ def run_benchmark(camera_id):
     print("\n" + "="*60)
     print("🏎️  RUNNING LIVE CAMERA BENCHMARK")
     print("="*60)
-    
+
     results = {}
     frames_to_test = 100
-    
+
     # 1. Run CPU Benchmark
     print(f"\n🔹 TEST 1: CPU (Optimized Fast Mode)")
     print("   - Model: YOLOv11 Nano")
@@ -1956,13 +2558,55 @@ def main():
                        help='Camera focal length in pixels (default: 435.75 from calibration)')
     parser.add_argument('--zoedepth-interval', type=int, default=30,
                        help='Run ZoeDepth every N frames for correction (default: 30)')
-    
+
+    # ── Rear-camera ADAS arguments ─────────────────────────────────────────
+    parser.add_argument('--rear-camera', action='store_true',
+                       help='Enable rear-camera ADAS mode '
+                            '(fisheye correction, bumper exclusion, '
+                            '3-zone proximity alerts, lateral-entry detection)')
+    parser.add_argument('--mounting-height', type=float, default=None,
+                       help='Camera mounting height above ground in metres '
+                            '(default: 0.75 m – typical rear camera)')
+    parser.add_argument('--alert-threshold', type=float, default=None,
+                       help='Override CRITICAL zone threshold in metres '
+                            '(default: 2.0 m)')
+
     args = parser.parse_args()
-    
+
     print("\n" + "="*60)
     print("🚗 REAL-TIME CAMERA VEHICLE DETECTION")
     print("="*60 + "\n")
-    
+
+    # ── Rear-camera ADAS startup banner ──────────────────────────────────
+    if args.rear_camera:
+        print("=" * 70)
+        print("📷  REAR-CAMERA ADAS MODE ACTIVE")
+        print("=" * 70)
+        print("Domain: Reversing / parking camera  (≠ front highway camera)")
+        print()
+        print("Training Pipeline (nuScenes → Waymo → Own data):")
+        print("  Step 1 – Pretrain  : BDD100K  (night/rain/low-light robustness)")
+        print("  Step 2 – Rear Adapt: nuScenes CAM_BACK + CAM_BACK_LEFT/RIGHT")
+        print("             ↳ 1.4M images, 1000 scenes, pedestrians from behind")
+        print("  Step 3 – Generalise: Waymo surround cameras")
+        print("             ↳ Higher quality labels, close pedestrians/cyclists")
+        print("  Step 4 – Domain Fix: Own rear-camera frames (500-1000 required)")
+        print("             ↳ YOUR fisheye lens + bumper + mounting height")
+        print()
+        print("Active Safety Classes (5 reliable classes, not 80 COCO):")
+        print("  Person | Bicycle | Two-wheeler | Car variants | Static obstacle")
+        print()
+        print("Proximity Zones:")
+        cfg = REAR_CAMERA_CONFIG
+        if args.alert_threshold:
+            cfg = dict(cfg)
+            cfg["zone_critical_m"] = args.alert_threshold
+        print(f"  🔴 CRITICAL  < {cfg['zone_critical_m']} m  – STOP immediately")
+        print(f"  🟠 DANGER    {cfg['zone_critical_m']}–{cfg['zone_danger_m']} m  – Slow down")
+        print(f"  🟡 CAUTION   {cfg['zone_danger_m']}–{cfg['zone_caution_m']} m  – Be aware")
+        print(f"  🟢 SAFE      > {cfg['zone_caution_m']} m  – Clear")
+        print("=" * 70 + "\n")
+
     # Interactive Mode (Only if explicitly set to None, which is no longer default)
     if args.camera is None:
         print("👋 Welcome! No camera specified.")
@@ -1993,12 +2637,20 @@ def main():
         run_benchmark(camera_id)
         return
 
+    # Build optional rear-camera config overrides
+    rear_config_overrides = {}
+    if args.alert_threshold is not None:
+        rear_config_overrides["zone_critical_m"] = args.alert_threshold
+
     # Initialize detector
     detector = CameraVehicleDetector(
         device=args.device,
         hybrid_depth=args.hybrid_depth,
         focal_length=args.focal_length,
-        zoedepth_interval=args.zoedepth_interval
+        zoedepth_interval=args.zoedepth_interval,
+        rear_mode=args.rear_camera,
+        mounting_height=args.mounting_height,
+        rear_config=rear_config_overrides if rear_config_overrides else None,
     )
     
     # Open camera or video file
