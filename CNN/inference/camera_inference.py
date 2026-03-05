@@ -2898,10 +2898,12 @@ def main():
             if frame_count % 10 == 0:
                 det_count = len(detections)
                 model_name = detector.ml_model_name if hasattr(detector, 'ml_model_name') else 'Unknown'
-                
-                # Show dual-depth system status
-                zoedepth_status = "Active" if hasattr(detector, 'ml_depth_map') and detector.ml_depth_map is not None else "Initializing"
-                print(f"[Frame {frame_count}] FPS: {fps:.1f} | ZoeDepth: {zoedepth_status} | Detections: {det_count}")
+
+                # Show depth model status - check the async depth worker's last result
+                _async_depth = getattr(detector, 'async_zoedepth', None)
+                _last_depth = getattr(_async_depth, 'last_depth_map', None)
+                depth_status = "Active" if _last_depth is not None else "Initializing"
+                print(f"[Frame {frame_count}] FPS: {fps:.1f} | Depth: {model_name} ({depth_status}) | Detections: {det_count}")
                 
                 # Print each detection
                 for det in detections[:5]:  # Show first 5
