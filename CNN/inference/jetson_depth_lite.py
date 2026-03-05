@@ -303,9 +303,30 @@ class AsyncDepthLite:
               f"input={input_h}×{input_w}")
 
     # ── Backend loader ────────────────────────────────────────────────────────
+    @staticmethod
+    def _onnx_has_gpu() -> bool:
+        """Return True only when onnxruntime-gpu is installed AND CUDA is usable."""
+        try:
+            import onnxruntime as ort
+            return "CUDAExecutionProvider" in ort.get_available_providers()
+        except ImportError:
+            return False
+
     def _load_backend(self, backend: str):
+        import torch
+        # When the host has a CUDA GPU but only CPU onnxruntime is installed,
+        # PyTorch-GPU is 5-10× faster than ONNX-CPU.  Reorder 'auto' accordingly.
+        if backend == "auto":
+            if torch.cuda.is_available() and not self._onnx_has_gpu():
+                auto_order = ["trt", "pytorch", "onnx", "fallback"]
+                print("ℹ️  [DepthLite] onnxruntime-gpu absent – using PyTorch GPU backend")
+            else:
+                auto_order = ["trt", "onnx", "pytorch", "fallback"]
+        else:
+            auto_order = None   # not used for non-auto
+
         order = {
-            "auto":    ["trt", "onnx", "pytorch", "fallback"],
+            "auto":    auto_order,
             "trt":     ["trt", "fallback"],
             "onnx":    ["onnx", "fallback"],
             "pytorch": ["pytorch", "fallback"],

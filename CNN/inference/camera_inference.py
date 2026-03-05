@@ -1332,17 +1332,29 @@ class CameraVehicleDetector:
 
         # Determine model paths
         if jetson_mode:
-            # Prefer TRT engine → ONNX → PyTorch fallback
+            # Check if onnxruntime-gpu is available (needed for ONNX to run on GPU)
+            _onnx_has_gpu = False
+            try:
+                import onnxruntime as _ort
+                _onnx_has_gpu = "CUDAExecutionProvider" in _ort.get_available_providers()
+            except ImportError:
+                pass
+
+            # Prefer TRT → ONNX-GPU → PyTorch-GPU (ONNX-CPU is slower than PyTorch-GPU)
             if Path(YOLO_TRT_JETSON).exists():
                 yolo_path = YOLO_TRT_JETSON
                 print(f"🚀 Jetson TRT YOLO: {yolo_path}")
-            elif Path(YOLO_ONNX_JETSON).exists():
+            elif Path(YOLO_ONNX_JETSON).exists() and _onnx_has_gpu:
                 yolo_path = YOLO_ONNX_JETSON
-                print(f"🔧 Jetson ONNX YOLO: {yolo_path}")
+                print(f"🔧 Jetson ONNX YOLO (GPU): {yolo_path}")
             else:
-                yolo_path = str(CNN_DIR / "models/yolo11n.pt")
-                print(f"⚠️  Jetson ONNX not found, using PyTorch nano: {yolo_path}")
-                print("   Run:  python scripts/export_jetson.py  to generate ONNX")
+                # Fall back to PyTorch YOLO11n – runs on CUDA via torch, ~30+ FPS
+                yolo_path = YOLO_MODEL_PATH_FAST
+                if Path(YOLO_ONNX_JETSON).exists() and not _onnx_has_gpu:
+                    print("ℹ️  ONNX found but onnxruntime-gpu absent → using PyTorch YOLO11n on GPU")
+                    print("   To use ONNX:  pip install onnxruntime-gpu")
+                else:
+                    print(f"ℹ️  Using PyTorch YOLO11n (lightweight, fast): {yolo_path}")
             classifier_path = (CLS_TRT_JETSON if Path(CLS_TRT_JETSON).exists()
                                else CLS_ONNX_JETSON if Path(CLS_ONNX_JETSON).exists()
                                else str(CNN_DIR / "models/classifier/weights/best.pt"))
@@ -1384,7 +1396,7 @@ class CameraVehicleDetector:
         if not (fast_mode or self.device.type == 'cpu'):
             print(f"📦 Loading Classifier: {classifier_path}")
             if Path(classifier_path).exists():
-                self.classifier = YOLO(classifier_path)
+                self.classifier = YOLO(classifier_path, task='classify')
                 print("✅ Classifier loaded")
             else:
                 print(f"❌ Classifier not found at {classifier_path}")
