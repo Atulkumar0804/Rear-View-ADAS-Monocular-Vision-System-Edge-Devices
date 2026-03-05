@@ -1872,35 +1872,33 @@ class CameraVehicleDetector:
         return distance
 
     def get_depth_map(self, frame, detections=None):
-        """Get depth map (retrieves ZoeDepth results intermittently, not every frame)"""
+        """Get depth map (retrieves async depth results intermittently, not every frame)"""
         if not self.use_depth:
             return None
 
         try:
-            # DUAL-DEPTH SYSTEM: Check for new ZoeDepth results
-            if self.use_hybrid and self.async_zoedepth is not None:
-                # Try to get latest ZoeDepth result (non-blocking)
+            # DUAL-DEPTH SYSTEM: Check for new async depth results
+            # Covers both hybrid mode (ZoeDepth) and jetson mode (MiDaS-Small)
+            if (self.use_hybrid or self.jetson_mode) and self.async_zoedepth is not None:
+                # Try to get latest depth result (non-blocking)
                 result = self.async_zoedepth.get_depth(wait=False)
                 if result is not None:
                     depth_map, inference_time = result
                     # Update cached ML depth map
                     self.ml_depth_map = depth_map
-                    # Print update notification (every 30 frames = ~1 sec at 30 FPS)
                     if not hasattr(self, '_zoedepth_update_count'):
                         self._zoedepth_update_count = 0
                     self._zoedepth_update_count += 1
-                    if self._zoedepth_update_count % 5 == 1:  # Print every 5th update
-                        print(f"🔄 ZoeDepth updated (inference: {inference_time:.3f}s)")
+                    if self._zoedepth_update_count % 5 == 1:
+                        model_lbl = getattr(self, 'ml_model_name', 'Depth')
+                        print(f"🔄 {model_lbl} updated (inference: {inference_time:.3f}s)")
 
-                # Return last known depth map (could be from previous frame)
-                # Classical method will use this to compute corrections
+                # Return last known depth map
                 if hasattr(self, 'ml_depth_map') and self.ml_depth_map is not None:
-                    # ── Rear-camera: reweight depth map to close-range ───
                     if self.rear_mode and self.rear_adapter is not None:
                         return self.rear_adapter.reweight_depth_map(self.ml_depth_map)
                     return self.ml_depth_map
                 else:
-                    # No ZoeDepth data yet, return None (classical will run solo)
                     return None
 
             # Use Hybrid Depth Switcher if available (legacy path)
@@ -1959,10 +1957,10 @@ class CameraVehicleDetector:
                         'class': YOLO_CLASS_MAPPING[cls_id]
                     })
 
-        # Request ZoeDepth update (runs intermittently, not every frame)
+        # Request ZoeDepth/MiDaS depth update (runs intermittently, not every frame)
         # This runs in background while we process detections
         frame_id = int(time.time() * 1000) % 10000  # Frame timestamp ID
-        if self.use_hybrid and self.async_zoedepth is not None:
+        if (self.use_hybrid or self.jetson_mode) and self.async_zoedepth is not None:
             # Request depth (will only run every N frames internally)
             zoedepth_requested = self.async_zoedepth.request_depth(frame)
             if zoedepth_requested:
@@ -2625,8 +2623,10 @@ def run_benchmark(camera_id):
 
 def main():
     parser = argparse.ArgumentParser(description='Real-time Camera Vehicle Detection')
-    parser.add_argument('--camera', type=str, default='2', 
-                       help='Camera device ID or video file path')
+    parser.add_argument('--camera', type=str, default='4',
+                       help='Camera device ID or video file path '
+                            '(default: 4 – monocular camera; '
+                            'use 2 for depth-sensor camera)')
     parser.add_argument('--width', type=int, default=640,
                        help='Camera width (default: 640)')
     parser.add_argument('--height', type=int, default=480,
