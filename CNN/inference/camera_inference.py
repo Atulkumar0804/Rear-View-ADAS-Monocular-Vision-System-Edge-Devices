@@ -2648,12 +2648,17 @@ def main():
     # ── Rear-camera ADAS arguments ─────────────────────────────────────────
     # ── Jetson deployment arguments ────────────────────────────────────────
     parser.add_argument('--jetson', action='store_true',
-                       help='Enable Jetson mode: ONNX/TRT YOLO + MiDaS-Small depth '
-                            '(replaces ZoeDepth). '
-                            'First run: python scripts/export_jetson.py')
+                       help='Enable Jetson mode: lightweight models (yolo11n + MiDaS-Small) '
+                            'on GPU. First run: python scripts/export_jetson.py')
     parser.add_argument('--imgsz', type=int, default=640,
                        help='YOLO inference image size override '
                             '(default 640; use 320 for Jetson Nano)')
+    parser.add_argument('--max-fps', type=float, default=None,
+                       help='Cap pipeline FPS to simulate target hardware. '
+                            'When --jetson is set, defaults to 25 FPS '
+                            '(Jetson Nano ONNX estimate). '
+                            'Use 35 for Jetson Nano TRT, 60 for Jetson Orin. '
+                            'Example: --max-fps 25')
     parser.add_argument('--rear-camera', action='store_true',
                        help='Enable rear-camera ADAS mode '
                             '(fisheye correction, bumper exclusion, '
@@ -2837,9 +2842,29 @@ def main():
     start_time = time.time()
     screenshot_count = 0
     enable_undistortion = False  # Disabled for normal view
-    
+
+    # ── FPS cap for Jetson simulation ───────────────────────────────────────────
+    # Jetson Nano ONNX baseline:  ~25 FPS (conservative, thermal throttle)
+    # Jetson Nano TRT FP16:       ~35 FPS
+    # Jetson Orin / Xavier NX:    ~60 FPS
+    _max_fps = getattr(args, 'max_fps', None)
+    if _max_fps is None and getattr(args, 'jetson', False):
+        _max_fps = 25.0   # default Jetson Nano ONNX simulation
+    _min_frame_time = (1.0 / _max_fps) if _max_fps else None
+    if _min_frame_time:
+        hw_name = (
+            f"Jetson Nano ONNX ~{_max_fps:.0f} FPS"
+            if getattr(args, 'jetson', False) and getattr(args, 'max_fps', None) is None
+            else f"capped at {_max_fps:.0f} FPS"
+        )
+        print(f"🔧 Compute-cap ACTIVE: {hw_name}")
+        print(f"   Simulating Jetson Nano workload on this GPU.")
+        print(f"   Override with --max-fps <N>  (e.g. --max-fps 35 for TRT)")
+    # ───────────────────────────────────────────────────────────────────────
+
     try:
         while True:
+            _frame_start = time.time()
             ret, frame = cap.read()
             if not ret:
                 if is_file:
@@ -2896,8 +2921,21 @@ def main():
             
             # Draw results
             annotated = detector.draw_detections(frame, detections, fps=fps, debug=args.debug)
-            
-            # Display
+
+            # ── Jetson FPS cap ─────────────────────────────────────────────
+            if _min_frame_time:
+                _elapsed_frame = time.time() - _frame_start
+                _sleep = _min_frame_time - _elapsed_frame
+                if _sleep > 0:
+                    time.sleep(_sleep)
+                # Overlay simulated-FPS badge on frame
+                _sim_fps = 1.0 / max(time.time() - _frame_start, 1e-6)
+                cv2.putText(annotated,
+                            f"[Jetson-sim {_sim_fps:.0f}FPS]",
+                            (10, annotated.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 200, 255), 1, cv2.LINE_AA)
+            # ───────────────────────────────────────────────────────────────
             cv2.imshow('Vehicle Detection - Press q to quit', annotated)
             
             # Save video
