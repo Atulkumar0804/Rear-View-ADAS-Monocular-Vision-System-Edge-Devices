@@ -255,9 +255,9 @@ class FLOPsCalculator:
             'total_tops': 0,
         }
         
-        # YOLO11x-seg (detection + segmentation)
-        yolo_stats = self.calculate_model_flops(YOLO_MODELS['yolo11x-seg'], runs_per_frame=1.0)
-        results['models']['yolo11x-seg'] = yolo_stats
+        # YOLO11n (detection only - segmentation removed)
+        yolo_stats = self.calculate_model_flops(YOLO_MODELS['yolo11n'], runs_per_frame=1.0)
+        results['models']['yolo11n'] = yolo_stats
         results['total_flops_per_frame'] += yolo_stats['flops_per_frame']
         
         # Classifier (runs per vehicle detection, not person/bicycle/motorcycle)
@@ -429,7 +429,7 @@ def generate_report(calculator: FLOPsCalculator) -> dict:
     # Display Heavy Mode
     print("⚡ HEAVY MODE (GPU High-Accuracy)")
     print("-" * 80)
-    print(f"Models: YOLO11x-seg + Classifier + ZoeDepth + Classical CV")
+    print(f"Models: {' + '.join(heavy_mode['models'].keys())} + Classical CV")
     print(f"Total FLOPs per frame: {heavy_mode['total_flops_per_frame']/1e9:.4f} GFLOPs")
     print(f"Required TOPS @ {calculator.target_fps} FPS: {heavy_mode['total_tops']:.4f} TOPS")
     print()

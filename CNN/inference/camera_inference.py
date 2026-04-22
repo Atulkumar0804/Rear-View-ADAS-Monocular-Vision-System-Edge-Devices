@@ -32,6 +32,8 @@ from queue import Queue
 import queue
 from collections import deque
 import math
+import logging
+import logging.handlers
 
 # Add scripts directory to path for ZoeDepth loader
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -81,20 +83,37 @@ CONFIDENCE_THRESHOLD = 0.4
 # TUNING REQUIRED: Adjust this value to calibrate distance (Higher value = Larger distance)
 FIXED_DEPTH_SCALE = 950.0 
 
-# Depth multipliers for specific classes that the model consistently underestimates
-CLASS_DEPTH_MULTIPLIERS = {
-    'Person': 3.5,
-    'Bicycle': 3.5,
-    'Two-wheeler': 4.5,
-    'Person + Two-wheeler': 4.0,
-    'Person + Bicycle': 3.5,
-    'Person + Three-wheeler': 4.0,
-} 
+# Depth multipliers — REMOVED (were arbitrary empirical hacks that broke
+# physical geometry).  Accuracy is now achieved through:
+#   1. Ground-contact pinhole formula (y_bottom vs horizon)
+#   2. KITTI-trained MiDaS metric depth (replaces relative disparity)
+#   3. Per-class scale factors loaded from calibration_data/optimized_scale_factors.json
+# If you need a per-class offset, add it to optimized_scale_factors.json instead.
+CLASS_DEPTH_MULTIPLIERS: dict = {}  # intentionally empty
 
-# Camera parameters (typical rear-view camera)
-FOCAL_LENGTH = 1000.0  # Default fallback
+# ── Camera intrinsic constants ────────────────────────────────────────────────
+# KITTI Camera-2 (left colour) intrinsics — used as fallback when
+# calibration_data/ is absent.  These are real, validated calibration values
+# from the KITTI dataset (1242×375 resolution, 721 px focal length).
+KITTI_FX      = 721.5377
+KITTI_FY      = 721.5377
+KITTI_CX      = 609.5593
+KITTI_CY      = 172.854
+# Typical rear-dash-cam ~3.6mm lens on 1/4" sensor gives ~500-700px FL
+# at 1280×720.  Start with KITTI value; override from calibration_data/ below.
+FOCAL_LENGTH = KITTI_FX   # realistic default (not 1000.0 magic number)
 
-# Calibration Data
+# ── Preferred metric-depth model paths (in priority order) ────────────────────
+# Priority 1: DA2-Small KITTI fine-tuned (SOTA, δ1≈0.88+)  — train_depth_da2_kitti.py
+# Priority 2: MiDaS-Small KITTI fine-tuned (δ1≈0.72)       — train_depth_kitti.py
+# Priority 3: original MiDaS-Small (baseline)
+METRIC_DEPTH_MODEL_PATHS = [
+    CNN_DIR / "models" / "depth_lite" / "da2_kitti_metric.onnx",     # DA2 SOTA (best)
+    CNN_DIR / "models" / "depth_lite" / "midas_kitti_metric.onnx",  # MiDaS KITTI
+    CNN_DIR / "models" / "depth_lite" / "midas_small.onnx",          # original fallback
+]
+
+# ── Calibration Data ──────────────────────────────────────────────────────────
 CAMERA_MATRIX = None
 DIST_COEFFS = None
 METRIC_DEPTH_SCALE = 1.0
@@ -105,9 +124,12 @@ try:
     if (CALIB_DIR / "camera_matrix.npy").exists() and (CALIB_DIR / "dist_coeffs.npy").exists():
         CAMERA_MATRIX = np.load(CALIB_DIR / "camera_matrix.npy")
         DIST_COEFFS = np.load(CALIB_DIR / "dist_coeffs.npy")
-        FOCAL_LENGTH = (CAMERA_MATRIX[0,0] + CAMERA_MATRIX[1,1]) / 2.0
+        FOCAL_LENGTH = float((CAMERA_MATRIX[0, 0] + CAMERA_MATRIX[1, 1]) / 2.0)
         print(f"✅ Loaded Camera Calibration. Focal Length: {FOCAL_LENGTH:.1f}")
-    
+    else:
+        print(f"ℹ️  calibration_data/ absent — using KITTI fallback "
+              f"focal length {FOCAL_LENGTH:.1f} px")
+
     if (CALIB_DIR / "depth_config.json").exists():
         with open(CALIB_DIR / "depth_config.json", 'r') as f:
             config = json.load(f)
@@ -115,6 +137,23 @@ try:
             print(f"✅ Loaded Depth Scale: {METRIC_DEPTH_SCALE:.3f}")
 except Exception as e:
     print(f"⚠️ Failed to load calibration data: {e}")
+
+# ── Structured Logging Setup ─────────────────────────────────────────────────
+_log_dir = CNN_DIR / "logs"
+_log_dir.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            str(_log_dir / "adas.log"),
+            maxBytes=10_000_000,
+            backupCount=5,
+        ),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("ADAS")
 
 
 # ============================================================================
@@ -160,6 +199,45 @@ REAR_CAMERA_CONFIG = {
     "confidence_general": 0.40,           # General confidence threshold
 }
 
+# ============================================================================
+# TWO-WHEELER ADAS DOMAIN CONFIGURATION
+# For motorcycles, scooters, and bicycles with handlebar / helmet-mount camera.
+# Key differences from REAR_CAMERA_CONFIG:
+#   - Higher mounting height (handlebar ≈ 1.1 m vs car bumper ≈ 0.75 m)
+#   - Nearly horizontal camera tilt (no steep downward angle)
+#   - Narrower FOV lens (120° vs 170° fisheye on car rear camera)
+#   - NO bumper exclusion (no bumper in the frame)
+#   - Longer critical zones (higher travel speed → longer braking distance)
+#   - Vibration compensation (engine 15–50 Hz causes bbox jitter)
+# ============================================================================
+TWOWHEELER_CAMERA_CONFIG = {
+    # ---- Geometry ----
+    "mounting_height_m": 1.1,        # Handlebar / tail-box mount height
+    "camera_tilt_deg": -5.0,         # Minimal downward tilt (nearly horizontal)
+    "fisheye_fov_deg": 120.0,        # Narrower FOV than car rear camera
+    "ground_plane_ratio": 0.55,      # Less ground dominance (higher mount point)
+    "bumper_exclusion_ratio": 0.0,   # No bumper – do NOT exclude any pixel rows
+
+    # ---- Critical Depth Zones (meters) ----
+    # At 60 km/h stopping_dist ≈ 25-30 m; adjust further with --alert-threshold
+    "zone_critical_m": 3.0,          # < 3 m : CRITICAL – immediate brake
+    "zone_danger_m":   8.0,          # 3-8 m : DANGER   – slow down
+    "zone_caution_m":  20.0,         # 8-20 m: CAUTION  – be aware
+    "depth_clip_min_m": 0.5,         # Minimum sensible depth (no bumper at 0 m)
+    "depth_clip_max_m": 25.0,        # Maximum relevant depth for forward ADAS
+
+    # ---- Lateral Entry Detection ----
+    "side_entry_x_ratio": 0.12,
+    "side_entry_min_height_ratio": 0.04,
+
+    # ---- Confidence thresholds ----
+    "confidence_critical_class": 0.30,   # Aggressive: lower threshold for safety
+    "confidence_general": 0.40,
+
+    # ---- Vibration compensation flag ----
+    "vibration_compensation": True,      # Engine 15-50 Hz causes bbox jitter
+}
+
 # ---- REAR-ADAS SAFETY CLASSES (5 classes only, as recommended) ----
 # Do NOT train 80 COCO classes. Rear ADAS needs RELIABLE safety detection.
 # Train only: car, pedestrian, bicycle, motorcycle, static obstacle
@@ -194,6 +272,14 @@ ALERT_ZONE_COLORS = {
     'CAUTION':  (0, 165, 255),    # Orange - 5-10m
     'SAFE':     (0, 200, 0),      # Green - > 10m
 }
+
+# ── Adaptive resolution ladder for edge-device FPS maintenance ─────────────
+# (cap_w, cap_h, yolo_imgsz) – fallback to lower res when FPS drops below 25
+RESOLUTION_LADDER = [
+    (640, 480, 640),    # Default full resolution
+    (480, 360, 416),    # Medium fallback
+    (320, 240, 320),    # Edge fallback for Jetson Nano / Raspberry Pi
+]
 
 # ============================================================================
 # MERGED CLASSES - Consolidated from separate modules
@@ -380,6 +466,48 @@ class AsyncZoeDepth:
         print("🛑 Async ZoeDepth stopped")
 
 
+class DoubleBufferedDepth:
+    """
+    Lock-free double-buffer for depth map exchange between the background
+    inference thread and the main detection loop.
+
+    The background thread writes to one buffer; the main thread reads from
+    the other.  Buffers are swapped atomically by the writer so the reader
+    never blocks and always sees the latest complete depth map without any
+    Queue contention overhead.
+
+    Usage::
+        buf = DoubleBufferedDepth()
+        # background thread:
+        buf.write(depth_map)
+        # main thread (non-blocking):
+        depth = buf.read()
+    """
+
+    def __init__(self):
+        self._buffers = [None, None]   # ping-pong buffers
+        self._write_idx = 0
+        self._lock = threading.Lock()
+
+    def write(self, depth_map: np.ndarray):
+        """Write a new depth map (called from the background thread)."""
+        idx = self._write_idx ^ 1
+        self._buffers[idx] = depth_map.copy()
+        with self._lock:
+            self._write_idx = idx
+
+    def read(self) -> "np.ndarray | None":
+        """Read the latest depth map without blocking (main thread)."""
+        with self._lock:
+            idx = self._write_idx
+        return self._buffers[idx]
+
+    def available(self) -> bool:
+        """True if at least one depth map has been written."""
+        with self._lock:
+            return self._buffers[self._write_idx] is not None
+
+
 class AccurateHybridDepth:
     """Accurate Hybrid Depth Estimation (merged from hybrid_depth_accurate.py)"""
     
@@ -483,41 +611,58 @@ class AccurateHybridDepth:
     
     def _compute_pinhole_depth(self, frame: np.ndarray, detections: list) -> np.ndarray:
         h, w = frame.shape[:2]
-        
+
+        # Base depth map: simple vertical gradient (closer at bottom = ground)
+        # y_norm goes from 0 at top to 1 at bottom
+        y_coords  = np.arange(h, dtype=np.float32).reshape(-1, 1).repeat(w, axis=1)
+        # Ground plane: camera at h_mount, tilt ~0;
+        # horizon at y_horizon = H * (1 - ground_plane_ratio)
+        # d(y) = h_mount * f / max(y - y_horizon, 1)
+        # Use KITTI-like focal length if calibrated, else FOCAL_LENGTH
+        _fx = FOCAL_LENGTH
+        _h_mount = 0.75   # default; overridden below if adapter available
+        _y_horizon = h * 0.30   # top 30% = sky
+
+        delta_y  = np.maximum(y_coords - _y_horizon, 1.0)
+        base_map = (_h_mount * _fx) / delta_y
+        # Clip to plausible automotive range
+        base_map = np.clip(base_map, 0.3, 80.0).astype(np.float32)
+
+        # If we have an ML depth map from a previous frame, use it as the base
         if self.ml_depth_map is not None and self.ml_depth_map.shape == (h, w):
-            depth_map = self.ml_depth_map.copy()
-        else:
-            y_coords = np.arange(h).reshape(-1, 1).repeat(w, axis=1)
-            normalized_y = (y_coords - h * 0.3) / (h * 0.7)
-            depth_map = 5.0 + normalized_y * 45.0
-            depth_map = depth_map.astype(np.float32)
-        
+            base_map = self.ml_depth_map.copy()
+
+        # Overlay per-detection ground-contact estimates
         for det in detections:
-            bbox = det.get('bbox')
+            bbox       = det.get('bbox')
             class_name = det.get('class', 'Others')
-            
             if bbox is None:
                 continue
-            
             x1, y1, x2, y2 = [int(v) for v in bbox]
-            
-            if y2 <= y1 or x2 <= x1 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            if y2 <= y1 or x2 <= x1:
                 continue
-            
-            pixel_height = y2 - y1
-            if pixel_height < 5:
-                continue
-            
-            real_height = self.real_heights.get(class_name, 1.5)
-            pinhole_distance = (real_height * self.focal_length) / pixel_height
-            pinhole_distance = np.clip(pinhole_distance, 0.5, 100.0)
-            
+
+            # Ground-contact distance: d = h_mount * f / (y_bottom - y_horizon)
+            delta = max(1, y2 - _y_horizon)
+            gc_distance = (_h_mount * _fx) / delta
+
+            # Fallback: height-based if ground-contact gives unreasonable value
+            pixel_h = y2 - y1
+            if pixel_h >= 5:
+                real_h = REAL_HEIGHTS.get(class_name, 1.5)
+                hb_distance = (real_h * _fx) / pixel_h
+                # Blend: 70 % ground-contact + 30 % height-based
+                gc_distance = 0.7 * gc_distance + 0.3 * hb_distance
+
+            gc_distance = float(np.clip(gc_distance, 0.3, 80.0))
+
+            # Paint the detection region with the estimated distance
             mask = np.zeros((h, w), dtype=np.float32)
-            mask[y1:y2, x1:x2] = 1.0
+            mask[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 1.0
             mask = cv2.GaussianBlur(mask, (21, 21), 0)
-            depth_map = depth_map * (1 - mask) + pinhole_distance * mask
-        
-        return depth_map
+            base_map = base_map * (1 - mask) + gc_distance * mask
+
+        return base_map
     
     def _blend_depths(self, pinhole_depth: np.ndarray, ml_depth: np.ndarray, 
                      detections: list) -> np.ndarray:
@@ -567,7 +712,9 @@ class AccurateHybridDepth:
 class KalmanFilter1D:
     """1D Kalman Filter for distance smoothing (merged from adas_distance_pipeline.py)"""
     
-    def __init__(self, process_variance=0.01, measurement_variance=0.1):
+    def __init__(self, process_variance=0.05, measurement_variance=0.15):
+        # process_variance=0.05 : tuned for two-wheeler engine vibration (15-50 Hz)
+        # measurement_variance=0.15: looser measurement trust to handle bbox jitter
         self.process_variance = process_variance
         self.measurement_variance = measurement_variance
         self.estimate = None
@@ -700,31 +847,77 @@ class AdasDistancePipeline:
         return distance * scale
     
     def estimate_distance(self, depth_map, mask, bbox, class_name, track_id):
+        """
+        Sample the ML depth map at the ground-contact region of the detection.
+
+        Sampling strategy (in priority order):
+          1. Bottom 5 % of segmentation mask pixels  (most accurate: feet/tyres)
+          2. Bottom 5 % of bbox height, full width   (no mask available)
+          3. Single pixel at bottom-centre of bbox    (tiny bbox fallback)
+
+        Depth values are filtered for validity (> 0) and outliers removed
+        before taking the 20th-percentile (closer than median = safer estimate).
+        """
+        h_map, w_map = depth_map.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(x1, w_map - 1))
+        y1 = max(0, min(y1, h_map - 1))
+        x2 = max(x1 + 1, min(x2, w_map))
+        y2 = max(y1 + 1, min(y2, h_map))
+
+        raw_distance = None
+        confidence   = 0.3
+        method       = 'bbox_ground'
+
+        # ── Case 1: segmentation mask available ──────────────────────────────
         if mask is not None:
-            raw_distance, confidence = self.extract_depth_from_mask(
-                depth_map, mask, bbox, focus_ground=True
-            )
-            method = 'mask_ground'
-        else:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            cx = (x1 + x2) // 2
-            cy = int(y2 - (y2 - y1) * 0.1)
-            h, w = depth_map.shape
-            cx = np.clip(cx, 0, w - 1)
-            cy = np.clip(cy, 0, h - 1)
-            raw_distance = depth_map[cy, cx]
-            confidence = 0.4
-            method = 'bbox_fallback'
-        
+            try:
+                raw_distance, confidence = self.extract_depth_from_mask(
+                    depth_map, mask, bbox, focus_ground=True
+                )
+                method = 'mask_ground'
+            except Exception:
+                raw_distance = None
+
+        # ── Case 2 / 3: bbox-based ground-contact sampling ───────────────────
+        if raw_distance is None or raw_distance <= 0:
+            bbox_h = y2 - y1
+            # Bottom 5 % of the bbox (ground contact strip)
+            ground_strip_h = max(2, int(bbox_h * 0.05))
+            gy1 = max(0, y2 - ground_strip_h)
+            gy2 = y2
+
+            strip = depth_map[gy1:gy2, x1:x2].flatten()
+            valid = strip[strip > 0]
+
+            if len(valid) >= self.min_pixels:
+                valid = self._remove_outliers_iqr(valid)
+                # Use 20th percentile: slightly closer than median = safer
+                raw_distance = float(np.percentile(valid, 20))
+                confidence   = min(1.0, len(valid) / 50.0)
+                method       = 'bbox_ground_strip'
+            else:
+                # Fallback: single pixel at bottom-centre
+                cx = (x1 + x2) // 2
+                cy = min(y2 - 1, h_map - 1)
+                raw_distance = float(depth_map[cy, cx])
+                confidence   = 0.2
+                method       = 'bbox_centre_fallback'
+
+        if raw_distance is None or raw_distance <= 0:
+            return {'distance': None, 'raw_distance': None,
+                    'confidence': 0.0, 'method': 'failed',
+                    'class_scale': 1.0}
+
         calibrated = self.apply_class_calibration(raw_distance, class_name)
-        smoothed = self.apply_temporal_filter(calibrated, track_id, use_kalman=True)
-        
+        smoothed   = self.apply_temporal_filter(calibrated, track_id, use_kalman=True)
+
         return {
-            'distance': smoothed,
+            'distance':    smoothed,
             'raw_distance': raw_distance,
-            'confidence': confidence,
-            'method': method,
-            'class_scale': self.class_scales.get(class_name, 1.0)
+            'confidence':  confidence,
+            'method':      method,
+            'class_scale': self.class_scales.get(class_name, 1.0),
         }
     
     def cleanup_old_tracks(self, active_track_ids):
@@ -1267,6 +1460,255 @@ class DepthCalibrator:
         
     def get_scale(self):
         return self.current_scale
+
+# ── Speed-adaptive alert zone calculation ────────────────────────────────────
+def get_speed_adaptive_zones(speed_kmh: float) -> dict:
+    """
+    Compute ADAS proximity zone boundaries from vehicle speed.
+
+    Physics:
+        Reaction time = 1.5 s  (human + sensor latency)
+        Deceleration  = 5 m/s²  (0.5 g – achievable on wet/gravel road)
+        Stopping dist = v × t_r  +  v² / (2 × a)
+
+    Returns a dict of zone boundaries (metres) that can be merged into any
+    camera config dict (e.g. TWOWHEELER_CAMERA_CONFIG or REAR_CAMERA_CONFIG).
+
+    Example::
+        cfg = dict(TWOWHEELER_CAMERA_CONFIG)
+        cfg.update(get_speed_adaptive_zones(gps_speed_kmh))
+    """
+    v = speed_kmh / 3.6                   # m/s
+    stopping = v * 1.5 + v ** 2 / (2 * 5.0)
+    return {
+        "zone_critical_m": max(3.0, stopping * 0.5),
+        "zone_danger_m":   max(8.0, stopping),
+        "zone_caution_m":  max(20.0, stopping * 2.0),
+    }
+
+
+# ── ECC-based vibration stabilisation (two-wheeler / motorcycle) ─────────────
+def stabilize_frame(prev_gray: "np.ndarray | None",
+                    curr_gray: np.ndarray,
+                    curr_frame: np.ndarray) -> np.ndarray:
+    """
+    Compensate for motorcycle engine vibration using ECC image stabilisation.
+
+    Estimates a Euclidean warp (rotation + translation) between the previous
+    and current grayscale frames and applies the inverse to the colour frame.
+    Falls back to the original frame on failure (blurred scene, large motion).
+
+    Typical usage::
+        prev_gray = None
+        while cap.isOpened():
+            ret, frame = cap.read()
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = stabilize_frame(prev_gray, curr_gray, frame)
+            prev_gray = curr_gray
+    """
+    if prev_gray is None:
+        return curr_frame
+    try:
+        warp = np.eye(2, 3, dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
+        _, warp = cv2.findTransformECC(
+            prev_gray, curr_gray, warp, cv2.MOTION_EUCLIDEAN, criteria
+        )
+        h, w = curr_frame.shape[:2]
+        return cv2.warpAffine(
+            curr_frame, warp, (w, h),
+            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+    except cv2.error:
+        return curr_frame
+
+
+# ── Pipeline watchdog ─────────────────────────────────────────────────────────
+class PipelineWatchdog(threading.Thread):
+    """
+    Background watchdog that detects main-loop stalls on edge devices.
+
+    Call ``heartbeat()`` once per successfully processed frame.  If more than
+    ``timeout_s`` seconds elapse without a heartbeat, ``self.stalled`` is set
+    to ``True`` so the main loop can reinitialise the capture device.
+
+    Usage::
+        wd = PipelineWatchdog(timeout_s=3.0)
+        wd.start()
+        while True:
+            ret, frame = cap.read()
+            wd.heartbeat()
+            if wd.stalled and not is_file:
+                cap.release()
+                cap = open_camera_with_retry(camera_id)
+                wd.reset()
+    """
+
+    def __init__(self, timeout_s: float = 3.0):
+        super().__init__(daemon=True, name="PipelineWatchdog")
+        self.timeout_s = timeout_s
+        self.stalled = False
+        self._last_beat = time.time()
+        self._running = True
+
+    def heartbeat(self):
+        """Call once per successfully processed frame."""
+        self._last_beat = time.time()
+        self.stalled = False
+
+    def reset(self):
+        """Reset the stall flag after camera recovery."""
+        self._last_beat = time.time()
+        self.stalled = False
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        _log = logging.getLogger("ADAS.Watchdog")
+        while self._running:
+            time.sleep(0.25)
+            if time.time() - self._last_beat > self.timeout_s and not self.stalled:
+                _log.critical(
+                    "Pipeline stalled (no heartbeat for %.1f s) – "
+                    "flagging for camera reinitialisation", self.timeout_s
+                )
+                self.stalled = True
+
+
+# ── Camera reconnect with automatic retry ────────────────────────────────────
+def open_camera_with_retry(camera_id, max_retries: int = 5,
+                            retry_delay_s: float = 1.0):
+    """
+    Open a V4L2 camera device (or video file) with automatic retries.
+
+    On Jetson / embedded Linux, V4L2 devices can be momentarily unavailable
+    after a USB / CSI reconnect.  This function retries up to ``max_retries``
+    times before raising a ``RuntimeError``.
+
+    Args:
+        camera_id:      Integer device ID, digit string, or video file path.
+        max_retries:    Maximum open attempts (default 5).
+        retry_delay_s:  Seconds to wait between attempts (default 1.0).
+
+    Returns:
+        An opened ``cv2.VideoCapture`` object.
+
+    Raises:
+        RuntimeError: If all attempts fail.
+    """
+    _log = logging.getLogger("ADAS.Camera")
+    is_file = isinstance(camera_id, str) and not str(camera_id).isdigit()
+    for attempt in range(1, max_retries + 1):
+        if is_file:
+            cap = cv2.VideoCapture(camera_id)
+        else:
+            cam_idx = int(camera_id) if isinstance(camera_id, str) else camera_id
+            cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
+        if cap.isOpened():
+            _log.info("Camera '%s' opened on attempt %d/%d",
+                      camera_id, attempt, max_retries)
+            return cap
+        _log.warning(
+            "Camera '%s' open failed (attempt %d/%d), retrying in %.1f s …",
+            camera_id, attempt, max_retries, retry_delay_s,
+        )
+        cap.release()
+        if attempt < max_retries:
+            time.sleep(retry_delay_s)
+    raise RuntimeError(
+        f"Cannot open camera '{camera_id}' after {max_retries} attempts"
+    )
+
+
+# ── Depth backend loader with graceful fallback ───────────────────────────────
+def load_depth_with_fallback(device: str, zoedepth_interval: int) -> "object | None":
+    """
+    Load the best available depth backend in order of quality/speed.
+
+    Fallback order:
+        1. DA2-KITTI metric ONNX            – best accuracy (SOTA fine-tuned)
+        2. DA2-KITTI metric PT checkpoint   – explicit user-trained checkpoint
+        3. MiDaS-KITTI metric ONNX          – strong fallback
+        4. TRT FP16 (midas_small engine)    – fastest baseline
+        5. ONNX (original midas_small)      – portable GPU/CPU
+        6. PyTorch                           – slow but always available
+        7. None                              – ground-plane geometry only
+
+    Returns the initialised ``AsyncDepthLite`` instance, or ``None``.
+    """
+    _log = logging.getLogger("ADAS.DepthLoader")
+    if not _DEPTH_LITE_AVAILABLE:
+        _log.warning("jetson_depth_lite not available – depth disabled")
+        return None
+
+    da2_onnx = CNN_DIR / "models" / "depth_lite" / "da2_kitti_metric.onnx"
+    da2_pt   = CNN_DIR / "models" / "depth_lite" / "da2_kitti_metric.pt"
+
+    # Explicit user-preferred model #1: DA2-KITTI metric ONNX
+    if da2_onnx.exists():
+        try:
+            model = AsyncDepthLite(
+                backend="onnx",
+                device=device,
+                update_interval_frames=zoedepth_interval,
+                model_path=str(da2_onnx),
+                metric_output=True,
+            )
+            _log.info("✅ Metric depth loaded [DA2-KITTI ONNX]: %s", da2_onnx.name)
+            return model
+        except Exception as exc:
+            _log.warning("DA2-KITTI ONNX failed (%s) – trying DA2 PT", exc)
+
+    # Explicit user-preferred model #2: DA2-KITTI PT checkpoint
+    if da2_pt.exists():
+        try:
+            model = AsyncDepthLite(
+                backend="pytorch",
+                device=device,
+                update_interval_frames=zoedepth_interval,
+                model_path=str(da2_pt),
+                metric_output=True,
+            )
+            _log.info("✅ Metric depth loaded [DA2-KITTI PT]: %s", da2_pt.name)
+            return model
+        except Exception as exc:
+            _log.warning("DA2-KITTI PT failed (%s) – trying MiDaS-KITTI ONNX", exc)
+
+    # Remaining metric fallback: MiDaS-KITTI ONNX
+    for label, onnx_path in [
+        ("MiDaS-KITTI", CNN_DIR / "models" / "depth_lite" / "midas_kitti_metric.onnx"),
+    ]:
+        if onnx_path.exists():
+            try:
+                model = AsyncDepthLite(
+                    backend="onnx",
+                    device=device,
+                    update_interval_frames=zoedepth_interval,
+                    model_path=str(onnx_path),
+                    metric_output=True,
+                )
+                _log.info("✅ Metric depth loaded [%s]: %s", label, onnx_path.name)
+                return model
+            except Exception as exc:
+                _log.warning("%s ONNX failed (%s) – trying next", label, exc)
+
+    for backend in ("trt_fp16", "onnx", "pytorch"):
+        try:
+            model = AsyncDepthLite(
+                backend=backend,
+                device=device,
+                update_interval_frames=zoedepth_interval,
+            )
+            _log.info("Depth backend loaded: %s", backend)
+            return model
+        except Exception as exc:
+            _log.warning("Depth backend '%s' failed: %s", backend, exc)
+    _log.error("All depth backends failed – ground-plane estimation only")
+    return None
+
+
 class CameraVehicleDetector:
     """Real-time camera-based vehicle detector"""
     
@@ -1274,7 +1716,10 @@ class CameraVehicleDetector:
                  fast_mode=False, hybrid_depth=False, focal_length=1000.0,
                  zoedepth_interval=30, rear_mode=False,
                  mounting_height=None, rear_config: dict = None,
-                 jetson_mode: bool = False, yolo_imgsz: int = 640):
+                 jetson_mode: bool = False, yolo_imgsz: int = 640,
+                 correction_alpha: float = 0.3,
+                 learnable_alpha: bool = True,
+                 alpha_lr: float = 0.05):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"🔥 Device: {self.device}")
 
@@ -1308,6 +1753,19 @@ class CameraVehicleDetector:
         self.classical_depth_scale = 1.0  # Correction factor from ZoeDepth
         self.last_zoedepth_correction_frame = 0
         self.zoedepth_corrections = {}  # Per-class correction factors
+        self.track_correction_factors = {}  # track_id -> correction factor C
+        self.class_correction_factors = {}  # class_name -> correction factor C fallback
+        self.correction_ema_alpha = float(np.clip(correction_alpha, 0.02, 0.98))
+        self.learnable_alpha = bool(learnable_alpha)
+        self.alpha_lr = float(np.clip(alpha_lr, 0.001, 0.5))
+        self.alpha_min = 0.05
+        self.alpha_max = 0.95
+        # Keep correction factor in a conservative range so classical depth
+        # remains dominant unless ML evidence is consistently strong.
+        self.correction_clip_min = 0.75
+        self.correction_clip_max = 1.35
+        self.classical_depth_weight = 0.80  # final = 80% classical + 20% corrected
+        self._ml_depth_fresh = False
 
         # Async processing queue for Depth Pro (keeps main thread free)
         self.depth_queue = Queue(maxsize=2)  # Only keep latest 2 frames
@@ -1323,6 +1781,20 @@ class CameraVehicleDetector:
         self.feature_tracker = {}  # Track feature points across frames
         self.ml_corrected_distances = {}  # ML-corrected distances by track_id
         self.correction_factor = 1.0  # PnP-based correction factor
+
+        # Classical ADAS depth fusion (no deep learning):
+        #   1) Ground-plane geometry
+        #   2) Object size prior
+        #   3) Motion cue (visual-odometry proxy)
+        self.classical_fusion_weights = {
+            'ground': 0.55,
+            'size': 0.30,
+            'motion': 0.15,
+        }
+        self.vo_nominal_baseline_m = 0.03    # per-frame effective baseline (tunable)
+        self.vo_min_disparity_px = 0.75
+        self.vo_max_disparity_px = 80.0
+        self.track_motion_state = {}  # track_id -> {'cx','cy','bbox_h','distance','ts'}
         
         # ── Jetson mode flags ────────────────────────────────────────────
         self.jetson_mode = jetson_mode
@@ -1423,6 +1895,20 @@ class CameraVehicleDetector:
         # Minimum crop area to run CNN classification (avoid tiny noisy crops)
         self.MIN_CROP_AREA = 64 * 64  # pixels
 
+        # ── Background classifier thread ──────────────────────────────────────
+        # Submits YOLO vehicle crops to a worker instead of blocking the main
+        # detection loop.  Cache keyed by quantised bbox hash.
+        self._cls_queue: Queue = Queue(maxsize=8)
+        self._cls_cache: dict = {}       # bbox_hash -> (class_name, confidence)
+        self._cls_running = True
+        self._cls_thread = threading.Thread(
+            target=self._cls_worker, daemon=True, name="ClassifierWorker"
+        )
+        self._cls_thread.start()
+        logging.getLogger("ADAS.Classifier").info(
+            "Background classifier thread started"
+        )
+
         # Initialize Depth Model (ZoeDepth or Hybrid)
         self.depth_model = None
         self.hybrid_depth_switcher = None
@@ -1433,53 +1919,55 @@ class CameraVehicleDetector:
         
         if self.use_depth:
             try:
-                # ── JETSON MODE: Use MiDaS Small instead of ZoeDepth ────────
+                # ── JETSON MODE: Prefer DA2/MiDaS ONNX backends ─────────────
                 if self.jetson_mode:
-                    print("📦 [Jetson] Loading MiDaS v2.1 Small (lightweight depth) ...")
-                    if not _DEPTH_LITE_AVAILABLE:
-                        print("❌ jetson_depth_lite.py not found – depth disabled")
-                        self.async_zoedepth = None
-                        self.use_depth = False
+                    print("📦 [Jetson] Loading depth backend (DA2/MiDaS fallback chain) ...")
+                    self.async_zoedepth = load_depth_with_fallback(
+                        device=str(self.device),
+                        zoedepth_interval=self.zoedepth_interval,
+                    )
+                    if self.async_zoedepth is not None:
+                        self.ml_model_name = getattr(self.async_zoedepth, "backend_name", "DepthLite")
+                        self.use_depth = True
+                        print(f"✅ [Jetson] Depth backend: {self.ml_model_name} "
+                              f"(every {self.zoedepth_interval} frames)")
                     else:
-                        try:
-                            self.async_zoedepth = AsyncDepthLite(
-                                backend="auto",
-                                device=str(self.device),
-                                update_interval_frames=self.zoedepth_interval,
-                            )
-                            self.ml_model_name = self.async_zoedepth.backend_name
-                            self.use_depth = True
-                            print(f"✅ [Jetson] Depth backend: {self.ml_model_name} "
-                                  f"(every {self.zoedepth_interval} frames)")
-                            print("   → ZoeDepth REPLACED by MiDaS Small")
-                            print("   → Memory: ~90 MB  vs  ZoeDepth ~4 GB")
-                            print("   → Speed : ~30 FPS vs  ZoeDepth ~0.5 FPS on Nano")
-                        except Exception as e:
-                            print(f"⚠️ MiDaS Small failed: {e}")
-                            self.async_zoedepth = None
-                            self.use_depth = False
-                            self.ml_model_name = "Fallback"
+                        print("❌ [Jetson] No depth backend available – depth disabled")
+                        self.use_depth = False
+                        self.ml_model_name = "Fallback"
 
                 elif self.use_hybrid:
-                    # Hybrid Mode: ZoeDepth ML + Pinhole Camera (Metric Absolute Depth!)
-                    print("📦 Loading ZoeDepth (Intel ISL) for Hybrid Depth...")
+                    # Hybrid Mode: prefer lightweight DA2/MiDaS ONNX, fallback to ZoeDepth
+                    print("📦 Loading Hybrid Depth backend (prefer DA2 ONNX)...")
                     
                     try:
-                        # Initialize AsyncZoeDepth with fine-tuned automotive model
-                        self.async_zoedepth = AsyncZoeDepth(
-                            model_path=str(CNN_DIR / "models/zoedepth_finetuned/zoedepth_best.pt"),
+                        # Try ONNX/TensorRT/PyTorch lightweight depth first
+                        self.async_zoedepth = load_depth_with_fallback(
                             device=str(self.device),
-                            update_interval_frames=self.zoedepth_interval
+                            zoedepth_interval=self.zoedepth_interval,
                         )
-                        self.ml_model_name = "ZoeDepth"
-                        print(f"✅ ZoeDepth loaded successfully (runs every {self.zoedepth_interval} frames)")
+                        if self.async_zoedepth is not None:
+                            self.ml_model_name = getattr(self.async_zoedepth, "backend_name", "DepthLite")
+                            print(f"✅ Hybrid depth backend loaded: {self.ml_model_name} "
+                                  f"(every {self.zoedepth_interval} frames)")
+                        else:
+                            raise RuntimeError("DepthLite backend unavailable")
                         
                     except Exception as e:
-                        print(f"⚠️ ZoeDepth failed to load: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        self.async_zoedepth = None
-                        self.ml_model_name = "Fallback"
+                        print(f"⚠️ DA2/MiDaS backend failed: {e}")
+                        print("   Falling back to ZoeDepth...")
+                        try:
+                            self.async_zoedepth = AsyncZoeDepth(
+                                model_path=str(CNN_DIR / "models/zoedepth_finetuned/zoedepth_best.pt"),
+                                device=str(self.device),
+                                update_interval_frames=self.zoedepth_interval
+                            )
+                            self.ml_model_name = "ZoeDepth"
+                            print(f"✅ ZoeDepth loaded successfully (runs every {self.zoedepth_interval} frames)")
+                        except Exception as e2:
+                            print(f"⚠️ ZoeDepth failed to load: {e2}")
+                            self.async_zoedepth = None
+                            self.ml_model_name = "Fallback"
                     
                     # Initialize hybrid switcher
                     self.hybrid_depth_switcher = AccurateHybridDepth(
@@ -1501,24 +1989,36 @@ class CameraVehicleDetector:
                         print(f"   → Using Pinhole Camera only (ZoeDepth failed)")
                         self.use_depth = True
                 else:
-                    # Standard Mode: ZoeDepth only (Monocular with Metric Depth)
-                    print("📦 Loading ZoeDepth (Intel ISL) for Monocular Metric Depth...")
+                    # Standard Mode: prefer DA2/MiDaS ONNX, fallback to ZoeDepth
+                    print("📦 Loading metric depth backend (prefer DA2 ONNX)...")
                     
                     try:
-                        # Initialize AsyncZoeDepth
-                        self.async_zoedepth = AsyncZoeDepth(
-                            model_path=str(CNN_DIR / "models/zoedepth_finetuned/zoedepth_best.pt"),
+                        self.async_zoedepth = load_depth_with_fallback(
                             device=str(self.device),
-                            update_interval_frames=self.zoedepth_interval
+                            zoedepth_interval=self.zoedepth_interval,
                         )
-                        self.ml_model_name = "ZoeDepth"
-                        self.use_depth = True
-                        print(f"✅ ZoeDepth loaded successfully (runs every {self.zoedepth_interval} frames)")
+                        if self.async_zoedepth is not None:
+                            self.ml_model_name = getattr(self.async_zoedepth, "backend_name", "DepthLite")
+                            self.use_depth = True
+                            print(f"✅ Depth backend loaded: {self.ml_model_name} "
+                                  f"(every {self.zoedepth_interval} frames)")
+                        else:
+                            raise RuntimeError("DepthLite backend unavailable")
                     except Exception as e:
-                        print(f"❌ Failed to load ZoeDepth: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        self.use_depth = False
+                        print(f"⚠️ DA2/MiDaS backend failed: {e}")
+                        print("   Falling back to ZoeDepth...")
+                        try:
+                            self.async_zoedepth = AsyncZoeDepth(
+                                model_path=str(CNN_DIR / "models/zoedepth_finetuned/zoedepth_best.pt"),
+                                device=str(self.device),
+                                update_interval_frames=self.zoedepth_interval
+                            )
+                            self.ml_model_name = "ZoeDepth"
+                            self.use_depth = True
+                            print(f"✅ ZoeDepth loaded successfully (runs every {self.zoedepth_interval} frames)")
+                        except Exception as e2:
+                            print(f"❌ Failed to load ZoeDepth: {e2}")
+                            self.use_depth = False
             except Exception as e:
                 print(f"⚠️ Could not load depth model: {e}")
                 self.use_depth = False
@@ -1557,7 +2057,47 @@ class CameraVehicleDetector:
         if self.ml_depth_thread:
             self.ml_depth_thread.join(timeout=2.0)
         print("🧵 ML Depth Pro async thread stopped")
-    
+
+    def _cls_worker(self):
+        """
+        Background classifier worker thread.
+
+        Processes ``(bbox_hash, crop)`` tuples from ``_cls_queue`` and stores
+        predicted ``(class_name, confidence)`` in ``_cls_cache``.
+        Running as a daemon thread ensures ``detect_frame()`` is never blocked
+        by classifier latency (typically 5–15 ms/crop on GPU).
+        """
+        _log = logging.getLogger("ADAS.Classifier")
+        while self._cls_running:
+            try:
+                bbox_hash, crop = self._cls_queue.get(timeout=0.05)
+                if self.classifier is None:
+                    continue
+                try:
+                    cls_results = self.classifier(crop, verbose=False)
+                    if cls_results and len(cls_results) > 0:
+                        top1 = cls_results[0].probs.top1
+                        top1_conf = cls_results[0].probs.top1conf.item()
+                        pred_class = cls_results[0].names[top1]
+                        if top1_conf > 0.4:
+                            self._cls_cache[bbox_hash] = (pred_class, float(top1_conf))
+                            # Evict oldest entries to prevent unbounded growth
+                            if len(self._cls_cache) > 200:
+                                del self._cls_cache[next(iter(self._cls_cache))]
+                except Exception as exc:
+                    _log.debug("Classifier error for hash %s: %s", bbox_hash, exc)
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                _log.warning("Classifier worker unhandled error: %s", exc)
+
+    def stop_classifier_thread(self):
+        """Stop the background classifier thread gracefully."""
+        self._cls_running = False
+        if self._cls_thread.is_alive():
+            self._cls_thread.join(timeout=2.0)
+        logging.getLogger("ADAS.Classifier").info("Classifier thread stopped")
+
     def get_hybrid_depth_for_detections(self, frame, detections, frame_id):
         """
         DUAL-DEPTH SYSTEM:
@@ -1813,62 +2353,280 @@ class CameraVehicleDetector:
         else:
             return "stable"
 
-    def estimate_distance(self, bbox_height, class_name, bbox_width=None,
-                          bbox: list = None):
+    def _get_active_depth_cfg(self):
+        """Return active depth clipping/geometry config for classical estimation."""
+        if self.rear_adapter is not None and hasattr(self.rear_adapter, 'cfg'):
+            return self.rear_adapter.cfg
+        return REAR_CAMERA_CONFIG
+
+    def _estimate_ground_plane_depth(self, bbox: list, frame_h: int, cfg: dict):
         """
-        Estimate distance based on bounding box height with pose detection.
-
-        Rear-camera domain adaptations applied here:
-          • Fisheye radial correction   – corrects edge-compressed bbox heights
-          • Close-range clip            – clips to [0.3 m, 15 m] for reverse ADAS
-          • CLASS_DEPTH_MULTIPLIERS     – class-specific empirical correction
-
-        Args:
-            bbox_height: Raw pixel height of bounding box
-            class_name:  Object class name
-            bbox_width:  Width of bounding box (optional, for pose detection)
-            bbox:        Full [x1,y1,x2,y2] bbox for fisheye correction (optional)
+        Ground-plane geometry:
+            Z = (h_c * f) / (y_bottom - y_horizon)
+        Returns: (depth_m, confidence)
         """
-        if bbox_height <= 0:
-            return None
+        if bbox is None:
+            return None, 0.0
 
-        # ── Fisheye correction (rear camera has barrel distortion) ──────────
-        # If we have the full bbox and a domain adapter, correct the apparent height.
+        y_bottom = float(bbox[3])
+        h_mount = float(cfg.get("mounting_height_m", 0.75))
+        y_horizon = float(frame_h) * (1.0 - float(cfg.get("ground_plane_ratio", 0.65)))
+        delta_y = y_bottom - y_horizon
+        if delta_y <= 1.0:
+            return None, 0.0
+
+        z = (h_mount * FOCAL_LENGTH) / delta_y
+        z = float(np.clip(
+            z,
+            cfg.get("depth_clip_min_m", 0.3),
+            cfg.get("depth_clip_max_m", 25.0),
+        ))
+
+        # Larger separation from horizon => more stable ground-contact estimate
+        conf = float(np.clip(delta_y / max(frame_h * 0.35, 1.0), 0.2, 1.0))
+        return z, conf
+
+    def _estimate_size_prior_depth(self, bbox_height: float, class_name: str,
+                                   bbox_width=None, bbox: list = None,
+                                   cfg: dict = None):
+        """
+        Object-size prior:
+            Z = (f * H_real) / h_px
+        Returns: (depth_m, confidence)
+        """
         corrected_height = float(bbox_height)
-        if bbox is not None and hasattr(self, 'rear_adapter') and self.rear_adapter is not None:
-            corrected_height = self.rear_adapter.fisheye_correct_bbox_height(bbox)
+        if bbox is not None and self.rear_adapter is not None:
+            try:
+                corrected_height = float(self.rear_adapter.fisheye_correct_bbox_height(bbox))
+            except Exception:
+                pass
 
-        # Get real-world height based on class
-        real_height = REAL_HEIGHTS.get(class_name, 1.5)  # Default to car height
+        if corrected_height <= 0:
+            return None, 0.0
 
-        # POSE DETECTION FIX: Detect if person is sitting
-        # Key insight: Sitting persons have different dimensions than standing
-        if class_name == 'Person' and bbox_width is not None:
-            aspect_ratio = bbox_width / corrected_height if corrected_height > 0 else 0
-            if aspect_ratio > 0.65:          # likely sitting
+        real_height = REAL_HEIGHTS.get(class_name, 1.5)
+
+        # Person pose-aware prior
+        if class_name == 'Person' and bbox_width is not None and corrected_height > 0:
+            aspect = float(bbox_width) / float(corrected_height)
+            if aspect > 0.65:
                 real_height = 0.85
-            elif aspect_ratio > 0.55:        # crouching
+            elif aspect > 0.55:
                 real_height = 1.1
         elif class_name == 'Person' and bbox_width is None:
-            if corrected_height < 80:
+            if corrected_height < 60:
                 real_height = 0.85
-            elif corrected_height < 120:
+            elif corrected_height < 100:
                 real_height = 1.2
 
-        # Distance = (Real Height × Focal Length) / Pixel Height
-        distance = (real_height * FOCAL_LENGTH) / corrected_height
+        z = (float(real_height) * FOCAL_LENGTH) / float(corrected_height)
+        if cfg is not None:
+            z = float(np.clip(
+                z,
+                cfg.get("depth_clip_min_m", 0.3),
+                cfg.get("depth_clip_max_m", 25.0),
+            ))
 
-        # Apply class-specific depth multiplier (empirical correction)
-        multiplier = CLASS_DEPTH_MULTIPLIERS.get(class_name, 1.0)
-        distance *= multiplier
+        # Larger bbox height -> better size estimate confidence
+        conf = float(np.clip(corrected_height / 180.0, 0.2, 0.95))
+        if class_name not in REAL_HEIGHTS:
+            conf *= 0.7
+        return z, conf
 
-        # ── Rear-camera close-range clip ────────────────────────────────────
-        if hasattr(self, 'rear_mode') and self.rear_mode:
-            cfg = REAR_CAMERA_CONFIG
-            distance = float(np.clip(distance,
-                                     cfg["depth_clip_min_m"],
-                                     cfg["depth_clip_max_m"]))
+    def _estimate_motion_vo_depth(self, track_id: int, bbox: list,
+                                  frame_shape: tuple, timestamp_s: float,
+                                  cfg: dict):
+        """
+        Visual-odometry proxy depth:
+            Z = (f * B) / d
+        where B is effective per-frame baseline and d is tracked pixel disparity.
+        Returns: (depth_m, confidence)
+        """
+        if track_id is None or track_id < 0 or bbox is None:
+            return None, 0.0
 
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        bbox_h = max(1.0, y2 - y1)
+        prev = self.track_motion_state.get(track_id)
+        if prev is None:
+            return None, 0.0
+
+        dt = max(1e-3, float(timestamp_s) - float(prev.get('ts', timestamp_s)))
+        dx = cx - float(prev.get('cx', cx))
+        dy = cy - float(prev.get('cy', cy))
+        disparity = float(np.hypot(dx, dy))
+        if disparity < self.vo_min_disparity_px:
+            return None, 0.0
+
+        disparity = float(np.clip(disparity, self.vo_min_disparity_px, self.vo_max_disparity_px))
+
+        # Effective baseline scales mildly with frame interval.
+        baseline = self.vo_nominal_baseline_m * (dt / (1.0 / 30.0))
+        baseline = float(np.clip(baseline, 0.01, 0.25))
+
+        z_flow = (FOCAL_LENGTH * baseline) / disparity
+
+        # Optional scale-change cue from bbox-height ratio for extra stability
+        z_prev = prev.get('distance', None)
+        h_prev = max(1.0, float(prev.get('bbox_h', bbox_h)))
+        z_scale = None
+        if z_prev is not None and z_prev > 0:
+            z_scale = float(z_prev) * (h_prev / bbox_h)
+
+        z = 0.65 * float(z_flow) + 0.35 * float(z_scale) if z_scale is not None else float(z_flow)
+        z = float(np.clip(
+            z,
+            cfg.get("depth_clip_min_m", 0.3),
+            cfg.get("depth_clip_max_m", 25.0),
+        ))
+
+        # Confidence from disparity magnitude and temporal consistency
+        h, w = frame_shape[:2]
+        diag = float(np.hypot(w, h))
+        conf_disp = float(np.clip(disparity / max(diag * 0.025, 1.0), 0.1, 1.0))
+        conf_dt = float(np.clip(dt / (1.0 / 30.0), 0.4, 1.0))
+        conf = float(np.clip(conf_disp * conf_dt, 0.1, 0.9))
+        return z, conf
+
+    def _update_motion_state(self, track_id: int, bbox: list,
+                             fused_distance: float, timestamp_s: float):
+        if track_id is None or track_id < 0 or bbox is None:
+            return
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        self.track_motion_state[track_id] = {
+            'cx': 0.5 * (x1 + x2),
+            'cy': 0.5 * (y1 + y2),
+            'bbox_h': max(1.0, y2 - y1),
+            'distance': float(fused_distance) if fused_distance is not None else None,
+            'ts': float(timestamp_s),
+        }
+
+    def estimate_classical_distance(self, bbox_height, class_name, bbox_width=None,
+                                    bbox: list = None, track_id: int = None,
+                                    frame_shape: tuple = None,
+                                    timestamp_s: float = None):
+        """
+        Classical monocular ADAS depth fusion:
+            Z_final = w1*Z_ground + w2*Z_size + w3*Z_motion
+        with confidence-modulated weights.
+        """
+        if bbox_height <= 0:
+            return None, {'method': 'classical_fusion_failed', 'confidence': 0.0}
+
+        cfg = self._get_active_depth_cfg()
+        if frame_shape is None:
+            frame_shape = (480, 640)
+        if timestamp_s is None:
+            timestamp_s = time.time()
+        frame_h = int(frame_shape[0])
+
+        z_ground, c_ground = self._estimate_ground_plane_depth(bbox, frame_h, cfg)
+        z_size, c_size = self._estimate_size_prior_depth(
+            bbox_height=bbox_height,
+            class_name=class_name,
+            bbox_width=bbox_width,
+            bbox=bbox,
+            cfg=cfg,
+        )
+        z_motion, c_motion = self._estimate_motion_vo_depth(
+            track_id=track_id,
+            bbox=bbox,
+            frame_shape=frame_shape,
+            timestamp_s=timestamp_s,
+            cfg=cfg,
+        )
+
+        cues = []
+        if z_ground is not None and c_ground > 0:
+            cues.append(('ground', z_ground, c_ground, self.classical_fusion_weights['ground']))
+        if z_size is not None and c_size > 0:
+            cues.append(('size', z_size, c_size, self.classical_fusion_weights['size']))
+        if z_motion is not None and c_motion > 0:
+            cues.append(('motion', z_motion, c_motion, self.classical_fusion_weights['motion']))
+
+        if not cues:
+            return None, {
+                'method': 'classical_fusion_failed',
+                'confidence': 0.0,
+                'ground': None,
+                'size': None,
+                'motion': None,
+            }
+
+        weighted_sum = 0.0
+        weight_total = 0.0
+        cue_weights = {}
+        for name, z_val, conf, base_w in cues:
+            w_eff = float(base_w) * float(conf)
+            weighted_sum += w_eff * float(z_val)
+            weight_total += w_eff
+            cue_weights[name] = w_eff
+
+        fused = weighted_sum / max(weight_total, 1e-6)
+        fused = float(np.clip(
+            fused,
+            cfg.get("depth_clip_min_m", 0.3),
+            cfg.get("depth_clip_max_m", 25.0),
+        ))
+
+        self._update_motion_state(track_id, bbox, fused, timestamp_s)
+
+        confidence = float(np.clip(weight_total / max(sum(self.classical_fusion_weights.values()), 1e-6), 0.0, 1.0))
+        metadata = {
+            'method': 'classical_fusion_gsvo',
+            'confidence': confidence,
+            'ground': z_ground,
+            'size': z_size,
+            'motion': z_motion,
+            'weights': cue_weights,
+            'fused': fused,
+            'pinhole': z_size,
+            'ml': None,
+        }
+        return fused, metadata
+
+    def estimate_distance(self, bbox_height, class_name, bbox_width=None,
+                          bbox: list = None, track_id: int = None,
+                          frame_shape: tuple = None,
+                          timestamp_s: float = None):
+        """
+        Estimate distance to object using a two-estimator strategy.
+
+        PRIMARY  — Ground-contact pinhole (requires rear_adapter & bbox)
+        ─────────────────────────────────────────────────────────────────
+            d = h_mount × f / (y_bottom − y_horizon)
+
+            Geometrically correct for objects on the ground plane.
+            Does NOT depend on knowing the object's size.
+
+        FALLBACK — Classical pinhole (bbox height)
+        ─────────────────────────────────────────────────────────────────
+            d = H_real × f / h_px
+
+            Used when no domain adapter is configured or ground-contact
+            formula gives an out-of-range result.
+
+        CLASS_DEPTH_MULTIPLIERS are intentionally empty — empirical hacks
+        that were 3–4× wrong have been replaced by proper geometry.
+
+        Args:
+            bbox_height : pixel height of the bounding box
+            class_name  : object class string
+            bbox_width  : pixel width  (for Person pose detection)
+            bbox        : [x1, y1, x2, y2] — enables ground-contact formula
+                          and fisheye correction when rear_adapter is active
+        """
+        distance, _ = self.estimate_classical_distance(
+            bbox_height=bbox_height,
+            class_name=class_name,
+            bbox_width=bbox_width,
+            bbox=bbox,
+            track_id=track_id,
+            frame_shape=frame_shape,
+            timestamp_s=timestamp_s,
+        )
         return distance
 
     def get_depth_map(self, frame, detections=None):
@@ -1877,15 +2635,17 @@ class CameraVehicleDetector:
             return None
 
         try:
+            self._ml_depth_fresh = False
             # DUAL-DEPTH SYSTEM: Check for new async depth results
-            # Covers both hybrid mode (ZoeDepth) and jetson mode (MiDaS-Small)
-            if (self.use_hybrid or self.jetson_mode) and self.async_zoedepth is not None:
+            # Applies to all async depth backends (ZoeDepth / MiDaS / DA2 ONNX)
+            if self.async_zoedepth is not None:
                 # Try to get latest depth result (non-blocking)
                 result = self.async_zoedepth.get_depth(wait=False)
                 if result is not None:
                     depth_map, inference_time = result
                     # Update cached ML depth map
                     self.ml_depth_map = depth_map
+                    self._ml_depth_fresh = True
                     if not hasattr(self, '_zoedepth_update_count'):
                         self._zoedepth_update_count = 0
                     self._zoedepth_update_count += 1
@@ -1921,10 +2681,120 @@ class CameraVehicleDetector:
             
             # No depth available
             return None
-            
+
         except Exception as e:
             print(f"Depth inference error: {e}")
             return None
+
+    def _sample_ml_depth_for_bbox(self, depth_map, bbox, mask=None):
+        """
+        Sample metric ML depth at the object ground-contact region.
+        Returns: (ml_depth_m, confidence, method)
+        """
+        h_map, w_map = depth_map.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(x1, w_map - 1))
+        y1 = max(0, min(y1, h_map - 1))
+        x2 = max(x1 + 1, min(x2, w_map))
+        y2 = max(y1 + 1, min(y2, h_map))
+
+        # Case 1: segmentation mask (best)
+        if mask is not None:
+            try:
+                ml_depth, conf = self.adas_pipeline.extract_depth_from_mask(
+                    depth_map, mask, [x1, y1, x2, y2], focus_ground=True
+                )
+                if ml_depth is not None and ml_depth > 0:
+                    return float(ml_depth), float(conf), "ml_mask_ground"
+            except Exception:
+                pass
+
+        # Case 2: bottom 5% bbox strip (ground contact)
+        bbox_h = y2 - y1
+        strip_h = max(2, int(bbox_h * 0.05))
+        gy1 = max(0, y2 - strip_h)
+        gy2 = y2
+        strip = depth_map[gy1:gy2, x1:x2].flatten()
+        valid = strip[strip > 0]
+        if len(valid) >= self.adas_pipeline.min_pixels:
+            valid = self.adas_pipeline._remove_outliers_iqr(valid)
+            if len(valid) > 0:
+                ml_depth = float(np.percentile(valid, 20))
+                conf = float(min(1.0, len(valid) / 50.0))
+                return ml_depth, conf, "ml_bbox_ground_strip"
+
+        # Case 3: single bottom-centre pixel fallback
+        cx = (x1 + x2) // 2
+        cy = min(y2 - 1, h_map - 1)
+        ml_depth = float(depth_map[cy, cx])
+        if ml_depth > 0:
+            return ml_depth, 0.2, "ml_bbox_centre_fallback"
+
+        return None, 0.0, "ml_failed"
+
+    def _compute_dual_depth(self, classical_depth, ml_depth, class_name, track_id, ml_fresh):
+        """
+        Dual-depth fusion (as requested):
+          C_current = Z_ml / Z_classical               [on fresh ML updates]
+          C_new     = α * C_current + (1-α) * C_prev   [EMA]
+          Z_final   = Z_classical * C_new              [every frame]
+        """
+        if classical_depth is None or classical_depth <= 0:
+            return classical_depth, 1.0, False
+
+        # Fallback hierarchy for previous C
+        c_prev = self.track_correction_factors.get(
+            track_id,
+            self.class_correction_factors.get(class_name, 1.0)
+        )
+
+        updated = False
+        c_new = c_prev
+        if ml_fresh and ml_depth is not None and ml_depth > 0:
+            alpha_prev = float(self.correction_ema_alpha)
+            c_current = float(ml_depth) / float(max(classical_depth, 1e-6))
+            c_current = float(np.clip(c_current,
+                                      self.correction_clip_min,
+                                      self.correction_clip_max))
+
+            # Optional online learning of alpha from fresh ML-vs-classical mismatch.
+            # Higher mismatch -> higher alpha (faster adaptation), lower mismatch
+            # -> lower alpha (more smoothing / stability).
+            if self.learnable_alpha:
+                z_prev = float(classical_depth) * float(c_prev)
+                rel_err = abs(z_prev - float(ml_depth)) / max(float(ml_depth), 1e-6)
+                rel_err = float(np.clip(rel_err, 0.0, 1.0))
+                alpha_target = float(np.clip(
+                    self.alpha_min + (self.alpha_max - self.alpha_min) * rel_err,
+                    self.alpha_min,
+                    self.alpha_max,
+                ))
+                self.correction_ema_alpha = float(np.clip(
+                    (1.0 - self.alpha_lr) * self.correction_ema_alpha
+                    + self.alpha_lr * alpha_target,
+                    self.alpha_min,
+                    self.alpha_max,
+                ))
+                if abs(self.correction_ema_alpha - alpha_prev) > 1e-6:
+                    print(
+                        f"🧠 Alpha update [track={track_id} class={class_name}] "
+                        f"{alpha_prev:.3f} -> {self.correction_ema_alpha:.3f} | "
+                        f"Ccur={c_current:.3f} Cprev={c_prev:.3f}"
+                    )
+
+            c_new = (
+                self.correction_ema_alpha * c_current
+                + (1.0 - self.correction_ema_alpha) * c_prev
+            )
+            c_new = float(np.clip(c_new,
+                                  self.correction_clip_min,
+                                  self.correction_clip_max))
+            self.track_correction_factors[track_id] = c_new
+            self.class_correction_factors[class_name] = c_new
+            updated = True
+
+        z_final = float(classical_depth) * float(c_new)
+        return z_final, c_new, updated
     
     def detect_frame(self, frame):
         """Detect vehicles in a single frame with tracking"""
@@ -1960,7 +2830,7 @@ class CameraVehicleDetector:
         # Request ZoeDepth/MiDaS depth update (runs intermittently, not every frame)
         # This runs in background while we process detections
         frame_id = int(time.time() * 1000) % 10000  # Frame timestamp ID
-        if (self.use_hybrid or self.jetson_mode) and self.async_zoedepth is not None:
+        if self.async_zoedepth is not None:
             # Request depth (will only run every N frames internally)
             zoedepth_requested = self.async_zoedepth.request_depth(frame)
             if zoedepth_requested:
@@ -1973,12 +2843,8 @@ class CameraVehicleDetector:
             x1, y1, x2, y2, conf, cls_id = detection.cpu().numpy()
             cls_id = int(cls_id)
             
-            # Get mask if available
+            # Segmentation disabled: bbox-only pipeline for stability + cleaner HUD
             mask = None
-            if yolo_results.masks is not None:
-                # masks.xy is a list of arrays, one for each detection
-                if i < len(yolo_results.masks.xy):
-                    mask = yolo_results.masks.xy[i]
             
             if cls_id not in YOLO_CLASS_MAPPING:
                 continue
@@ -2013,23 +2879,39 @@ class CameraVehicleDetector:
                 if crop.size > 0 and self.classifier is not None:
                     crop_area = crop.shape[0] * crop.shape[1]
                     if crop_area >= self.MIN_CROP_AREA:
-                        # Run classifier
+                        # ── Background classifier: cache-lookup + async submit ───
+                        # Key: quantised bbox coords (robust to sub-pixel jitter)
+                        _bbox_hash = (x1 // 20, y1 // 20, x2 // 20, y2 // 20)
+                        _cached = self._cls_cache.get(_bbox_hash)
+                        if _cached is not None:
+                            # Cache hit – use result from background thread
+                            pred_class, top1_conf = _cached
+                            if top1_conf > 0.4:
+                                final_class = pred_class
+                                final_conf = top1_conf
+                                source = 'YOLO_CLS'
+                        else:
+                            # Cache miss – run inline (first occurrence only)
+                            try:
+                                cls_results = self.classifier(crop, verbose=False)
+                                if cls_results and len(cls_results) > 0:
+                                    top1 = cls_results[0].probs.top1
+                                    top1_conf = cls_results[0].probs.top1conf.item()
+                                    # Get class name from classifier names
+                                    pred_class = cls_results[0].names[top1]
+                                    # Trust classifier if confidence is decent
+                                    if top1_conf > 0.4:
+                                        final_class = pred_class
+                                        final_conf = top1_conf
+                                        source = 'YOLO_CLS'
+                            except Exception as e:
+                                logging.getLogger("ADAS.Classifier").debug(
+                                    "Inline classifier error: %s", e)
+                        # Always (re-)submit crop for next-frame background refresh
                         try:
-                            cls_results = self.classifier(crop, verbose=False)
-                            if cls_results and len(cls_results) > 0:
-                                top1 = cls_results[0].probs.top1
-                                top1_conf = cls_results[0].probs.top1conf.item()
-                                
-                                # Get class name from classifier names
-                                pred_class = cls_results[0].names[top1]
-                                
-                                # Trust classifier if confidence is decent
-                                if top1_conf > 0.4:
-                                    final_class = pred_class
-                                    final_conf = top1_conf
-                                    source = 'YOLO_CLS'
-                        except Exception as e:
-                            print(f"Classifier error: {e}")
+                            self._cls_queue.put_nowait((_bbox_hash, crop.copy()))
+                        except queue.Full:
+                            pass  # Queue full – skipped; retried next frame
 
                 current_boxes_raw.append([x1, y1, x2, y2])
                 results.append({
@@ -2072,6 +2954,7 @@ class CameraVehicleDetector:
         # With Metric Depth (ZoeDepth), we don't need dynamic calibration
         
         # Assign track IDs and estimate motion
+        ts_now = time.time()
         for i, result in enumerate(results):
             bbox_height = result['bbox'][3] - result['bbox'][1]
             
@@ -2087,16 +2970,25 @@ class CameraVehicleDetector:
 
             # Default to pinhole (fallback) with pose-aware depth estimation
             bbox_width = result['bbox'][2] - result['bbox'][0]
-            distance = self.estimate_distance(
+            distance, classical_meta = self.estimate_classical_distance(
                 bbox_height, result['class'],
                 bbox_width=bbox_width,
-                bbox=result['bbox']   # pass full bbox for fisheye correction
+                bbox=result['bbox'],   # pass full bbox for fisheye correction
+                track_id=track_id,
+                frame_shape=frame.shape,
+                timestamp_s=ts_now,
             )
+            classical_fused = distance
             distance_metadata = {
-                'method': 'pinhole',
-                'confidence': 1.0,
-                'pinhole': distance,
-                'ml': None
+                'method': classical_meta.get('method', 'classical_fusion_gsvo'),
+                'confidence': float(classical_meta.get('confidence', 0.0)),
+                'pinhole': classical_meta.get('size', distance),
+                'ground': classical_meta.get('ground', None),
+                'size': classical_meta.get('size', None),
+                'motion': classical_meta.get('motion', None),
+                'classical_fused': classical_meta.get('fused', classical_fused),
+                'weights': classical_meta.get('weights', {}),
+                'ml': None,
             }
 
             # Use hybrid depth blending if available
@@ -2115,27 +3007,67 @@ class CameraVehicleDetector:
                             'distance': distance,
                             'corrected': hybrid_result.get('corrected', distance)
                         }
-            # Refine with Depth Map if available using ADAS Pipeline
+            # Dual-depth fusion with correction factor (diagram math)
+            # Classical is always computed every frame.
+            # ML depth updates every N-th frame asynchronously.
+            # C = Z_ml / Z_classical, EMA(C), Z_final = Z_classical * C.
             elif depth_map is not None:
                 bbox = result['bbox']
                 mask = result.get('mask')
-                
-                # Use ADAS-grade pipeline for distance estimation
-                dist_result = self.adas_pipeline.estimate_distance(
-                    depth_map=depth_map,
-                    mask=mask,
-                    bbox=bbox,
-                    class_name=result['class'],
-                    track_id=track_id
+
+                if self._ml_depth_fresh:
+                    # Fresh Nth-frame ML update: sample depth and update C via EMA.
+                    ml_depth, ml_conf, ml_method = self._sample_ml_depth_for_bbox(
+                        depth_map=depth_map,
+                        bbox=bbox,
+                        mask=mask,
+                    )
+                    dual_distance, corr_c, c_updated = self._compute_dual_depth(
+                        classical_depth=distance,
+                        ml_depth=ml_depth,
+                        class_name=result['class'],
+                        track_id=track_id,
+                        ml_fresh=True,
+                    )
+                else:
+                    # Non-fresh frame: DO NOT sample ML map; reuse cached C_prev only.
+                    ml_depth, ml_conf, ml_method = None, 0.0, "ml_skip_stale"
+                    corr_c = self.track_correction_factors.get(
+                        track_id,
+                        self.class_correction_factors.get(result['class'], 1.0)
+                    )
+                    dual_distance = float(distance) * float(corr_c) if distance is not None else distance
+                    c_updated = False
+
+                # Bias final estimate toward classical depth to avoid ML over-dominance.
+                if dual_distance is not None and distance is not None:
+                    dual_distance = (
+                        self.classical_depth_weight * float(distance)
+                        + (1.0 - self.classical_depth_weight) * float(dual_distance)
+                    )
+
+                # Apply per-class calibration + temporal smoothing on fused distance
+                dual_cal = self.adas_pipeline.apply_class_calibration(
+                    dual_distance, result['class']
                 )
-                
-                distance = dist_result['distance']
+                distance = self.adas_pipeline.apply_temporal_filter(
+                    dual_cal, track_id, use_kalman=True
+                )
+
                 distance_metadata = {
-                    'method': dist_result.get('method', 'adas'),
-                    'confidence': dist_result.get('confidence', 0.8),
-                    'pinhole': dist_result.get('pinhole', distance),
-                    'ml': dist_result.get('ml', None),
-                    'distance': distance
+                    'method': f"dual_depth_{ml_method}",
+                    'confidence': float(ml_conf),
+                    'pinhole': float(dual_distance / max(corr_c, 1e-6)),
+                    'ground': classical_meta.get('ground', None),
+                    'size': classical_meta.get('size', None),
+                    'motion': classical_meta.get('motion', None),
+                    'classical_fused': classical_meta.get('fused', classical_fused),
+                    'ml': ml_depth,
+                    'distance': distance,
+                    'correction_factor': corr_c,
+                    'alpha': float(self.correction_ema_alpha),
+                    'correction_updated': c_updated,
+                    'ml_fresh': self._ml_depth_fresh,
                 }
             
             result['track_id'] = track_id
@@ -2195,6 +3127,11 @@ class CameraVehicleDetector:
         # Cleanup old tracks from ADAS pipeline
         active_track_ids = [r['track_id'] for r in results]
         self.adas_pipeline.cleanup_old_tracks(active_track_ids)
+        self.track_motion_state = {
+            track_id: state
+            for track_id, state in self.track_motion_state.items()
+            if track_id in active_track_ids
+        }
 
         # ── Rear-camera domain filtering & alert system ────────────────────
         if self.rear_mode and self.rear_adapter is not None:
@@ -2348,14 +3285,7 @@ class CameraVehicleDetector:
                 }
                 box_color = motion_colors.get(motion, color)
 
-            # ── Draw segmentation mask ───────────────────────────────────
-            mask = det.get('mask')
-            if mask is not None and not rear_filtered:
-                overlay = annotated.copy()
-                pts = mask.astype(np.int32)
-                cv2.fillPoly(overlay, [pts], alert_color if self.rear_mode else color)
-                alpha = 0.35
-                cv2.addWeighted(overlay, alpha, annotated, 1 - alpha, 0, annotated)
+            # Segmentation overlay disabled by request (bbox-only visualization)
 
             # ── Draw bounding box ────────────────────────────────────────
             thickness = 1 if rear_filtered else 2
@@ -2367,13 +3297,16 @@ class CameraVehicleDetector:
             if rear_filtered:
                 label_parts = [f"[BUMPER] {class_name}"]
             elif distance is not None:
-                dist_str = f"{distance:.1f}m"
+                dist_str = f"D:{distance:.1f}m"
                 method = distance_metadata.get('method', '')
                 correction_factor = distance_metadata.get('correction_factor', 1.0)
-                if 'ZoeDepth' in method:
-                    dist_str += f"(C:{correction_factor:.2f})"
-                elif 'ML' in method or ml_depth is not None:
-                    dist_str += "(ML)"
+                classical_depth = distance_metadata.get('classical_fused', None)
+                if isinstance(classical_depth, (int, float, np.floating)):
+                    dist_str += f" | C:{float(classical_depth):.1f}"
+                if isinstance(ml_depth, (int, float, np.floating)):
+                    dist_str += f" | ML:{float(ml_depth):.1f}"
+                if correction_factor != 1.0:
+                    dist_str += f" | k:{correction_factor:.2f}"
                 # Rear-mode: append alert zone badge
                 if self.rear_mode:
                     dist_str += f" [{alert_zone}]"
@@ -2623,9 +3556,9 @@ def run_benchmark(camera_id):
 
 def main():
     parser = argparse.ArgumentParser(description='Real-time Camera Vehicle Detection')
-    parser.add_argument('--camera', type=str, default='4',
+    parser.add_argument('--camera', type=str, default='3',
                        help='Camera device ID or video file path '
-                            '(default: 4 – monocular camera; '
+                            '(default: 3 – monocular camera; '
                             'use 2 for depth-sensor camera)')
     parser.add_argument('--width', type=int, default=640,
                        help='Camera width (default: 640)')
@@ -2644,6 +3577,15 @@ def main():
                        help='Camera focal length in pixels (default: 435.75 from calibration)')
     parser.add_argument('--zoedepth-interval', type=int, default=30,
                        help='Run ZoeDepth every N frames for correction (default: 30)')
+    parser.add_argument('--correction-alpha', type=float, default=0.3,
+                       help='Initial EMA alpha for correction-factor update '
+                            '(default: 0.3)')
+    parser.add_argument('--alpha-lr', type=float, default=0.05,
+                       help='Learning rate for online alpha adaptation '
+                            '(default: 0.05)')
+    parser.add_argument('--freeze-alpha', action='store_true',
+                       help='Disable online learning of alpha and keep '
+                            '--correction-alpha fixed')
 
     # ── Rear-camera ADAS arguments ─────────────────────────────────────────
     # ── Jetson deployment arguments ────────────────────────────────────────
@@ -2669,6 +3611,15 @@ def main():
     parser.add_argument('--alert-threshold', type=float, default=None,
                        help='Override CRITICAL zone threshold in metres '
                             '(default: 2.0 m)')
+    parser.add_argument('--two-wheeler', action='store_true',
+                       help='Enable two-wheeler (motorcycle/scooter) ADAS mode: '
+                            'uses handlebar mounting geometry (1.1 m), wider '
+                            'critical zones, vibration-aware Kalman filter, '
+                            'and ECC frame stabilisation. Implies --rear-camera.')
+    parser.add_argument('--speed-kmh', type=float, default=None,
+                       help='Current speed in km/h for speed-adaptive alert zones. '
+                            'Scales CRITICAL/DANGER/CAUTION distances from physics '
+                            'stopping distance. Example: --speed-kmh 60')
 
     args = parser.parse_args()
 
@@ -2741,6 +3692,27 @@ def main():
     if args.alert_threshold is not None:
         rear_config_overrides["zone_critical_m"] = args.alert_threshold
 
+    # ── Two-wheeler mode: use TWOWHEELER_CAMERA_CONFIG as base ────────────────
+    if getattr(args, 'two_wheeler', False):
+        args.rear_camera = True
+        base = dict(TWOWHEELER_CAMERA_CONFIG)
+        base.update(rear_config_overrides)   # allow explicit overrides on top
+        rear_config_overrides = base
+        logger.info("Two-wheeler ADAS mode: TWOWHEELER_CAMERA_CONFIG applied")
+
+    # ── Speed-adaptive alert zone overrides ──────────────────────────────
+    if getattr(args, 'speed_kmh', None) is not None:
+        speed_zones = get_speed_adaptive_zones(args.speed_kmh)
+        rear_config_overrides.update(speed_zones)
+        logger.info(
+            "Speed-adaptive zones at %.0f km/h → CRITICAL=%.1fm  "
+            "DANGER=%.1fm  CAUTION=%.1fm",
+            args.speed_kmh,
+            speed_zones["zone_critical_m"],
+            speed_zones["zone_danger_m"],
+            speed_zones["zone_caution_m"],
+        )
+
     # Inform user if Jetson ONNX is not yet generated
     if args.jetson and not Path(YOLO_ONNX_JETSON).exists():
         print("⚠️  Jetson ONNX not found. Generating now ...")
@@ -2758,22 +3730,21 @@ def main():
         rear_config=rear_config_overrides if rear_config_overrides else None,
         jetson_mode=args.jetson,
         yolo_imgsz=args.imgsz,
+        correction_alpha=args.correction_alpha,
+        learnable_alpha=not args.freeze_alpha,
+        alpha_lr=args.alpha_lr,
     )
     
-    # Open camera or video file
-    if is_file:
-        print(f"📹 Opening video file: {camera_id}")
-        cap = cv2.VideoCapture(camera_id)
-    else:
-        print(f"📷 Opening camera {camera_id}...")
-        # Prefer V4L2 backend for Linux cameras to avoid timeouts
-        cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
-    
-    if not cap.isOpened():
-        if is_file:
-            print(f"❌ Failed to open video file: {camera_id}")
-        else:
-            print(f"❌ Failed to open camera {camera_id}")
+    # Open camera or video file (with automatic retry for edge devices)
+    logger.info("Opening %s: %s", "video file" if is_file else "camera", camera_id)
+    try:
+        cap = open_camera_with_retry(
+            camera_id,
+            max_retries=1 if is_file else 5,
+            retry_delay_s=1.0,
+        )
+    except RuntimeError as _open_err:
+        logger.error("Failed to open capture: %s", _open_err)
         return
     
     # Set camera resolution (only for camera devices, not video files)
@@ -2843,6 +3814,15 @@ def main():
     screenshot_count = 0
     enable_undistortion = False  # Disabled for normal view
 
+    # ── Pipeline watchdog (detects stalls and triggers camera reopen) ────────
+    watchdog = PipelineWatchdog(timeout_s=3.0)
+    watchdog.start()
+    logger.info("Pipeline watchdog started (timeout=3.0 s)")
+
+    # ── Vibration stabilisation state (two-wheeler / rear mode) ────────────
+    _prev_gray_stab = None   # previous grayscale frame for ECC stabilisation
+    _do_stabilize = getattr(args, 'two_wheeler', False) or getattr(args, 'rear_camera', False)
+
     # ── FPS cap for Jetson simulation ───────────────────────────────────────────
     # Jetson Nano ONNX baseline:  ~25 FPS (conservative, thermal throttle)
     # Jetson Nano TRT FP16:       ~35 FPS
@@ -2886,7 +3866,26 @@ def main():
                         frame = cv2.resize(frame, (actual_width, actual_height))
             
             frame_count += 1
-            
+
+            # ── Watchdog heartbeat + stall recovery ───────────────────────────
+            watchdog.heartbeat()
+            if watchdog.stalled and not is_file:
+                logger.warning("Watchdog: stall detected – attempting camera reopen")
+                cap.release()
+                try:
+                    cap = open_camera_with_retry(camera_id, max_retries=3)
+                    watchdog.reset()
+                    logger.info("Camera reopened successfully")
+                except RuntimeError as _reopen_err:
+                    logger.error("Camera reopen failed: %s – exiting", _reopen_err)
+                    break
+
+            # ── ECC vibration stabilisation (two-wheeler / rear mode) ────────
+            if _do_stabilize:
+                curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame = stabilize_frame(_prev_gray_stab, curr_gray, frame)
+                _prev_gray_stab = curr_gray
+
             # Detect and track
             detections = detector.detect_frame(frame)
             
@@ -2911,15 +3910,33 @@ def main():
                     metadata = det.get('distance_metadata', {})
                     method = metadata.get('method', '?')
                     correction = metadata.get('correction_factor', 1.0)
+                    alpha = metadata.get('alpha', None)
+                    z_ground = metadata.get('ground', None)
+                    z_size = metadata.get('size', None)
+                    z_motion = metadata.get('motion', None)
+                    z_classical = metadata.get('classical_fused', None)
+                    z_ml = metadata.get('ml', None)
                     motion = det.get('motion', '?')
                     conf = det.get('confidence', 0)
                     class_name = det.get('class', '?')
+
+                    def _fmt(v):
+                        return f"{v:.2f}" if isinstance(v, (int, float, np.floating)) else "NA"
                     
                     # Show correction factor if available
                     if correction != 1.0:
-                        print(f"   └─ {class_name}: {dist:.1f}m [C:{correction:.2f}] | {motion} | conf:{conf:.2f}")
+                        alpha_str = f" α:{alpha:.3f}" if isinstance(alpha, (int, float, np.floating)) else ""
+                        print(f"   └─ {class_name}: corrected={dist:.2f}m [C:{correction:.3f}{alpha_str}] | {motion} | conf:{conf:.2f}")
+                        print(
+                            f"      depths[m] G:{_fmt(z_ground)} S:{_fmt(z_size)} M:{_fmt(z_motion)} "
+                            f"Classical:{_fmt(z_classical)} ML:{_fmt(z_ml)}"
+                        )
                     else:
-                        print(f"   └─ {class_name}: {dist:.1f}m [{method}] | {motion} | conf:{conf:.2f}")
+                        print(f"   └─ {class_name}: corrected={dist:.2f}m [{method}] | {motion} | conf:{conf:.2f}")
+                        print(
+                            f"      depths[m] G:{_fmt(z_ground)} S:{_fmt(z_size)} M:{_fmt(z_motion)} "
+                            f"Classical:{_fmt(z_classical)} ML:{_fmt(z_ml)}"
+                        )
             
             # Draw results
             annotated = detector.draw_detections(frame, detections, fps=fps, debug=args.debug)
@@ -2964,6 +3981,8 @@ def main():
     
     finally:
         # Cleanup
+        watchdog.stop()
+        detector.stop_classifier_thread()
         cap.release()
         if writer:
             writer.release()

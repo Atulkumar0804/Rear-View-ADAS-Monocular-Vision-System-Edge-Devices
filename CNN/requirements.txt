@@ -13,6 +13,8 @@ flask>=3.0.0
 transformers>=4.30.0
 huggingface_hub>=0.16.0
 timm>=0.9.0
+bytetrack>=0.1.2
+scipy>=1.11.0
 
 # Depth Pro - Apple's zero-shot metric depth model (no camera intrinsics needed)
 # Install with: pip install git+https://github.com/apple/ml-depth-pro.git

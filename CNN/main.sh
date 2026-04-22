@@ -3,8 +3,18 @@
 # Main CNN Launcher - Easy access to all features
 #
 
-PYTHON="/home/atul/Desktop/atul/rear_view_adas_monocular/.venv/bin/python"
 CNN_DIR="/home/atul/Desktop/atul/rear_view_adas_monocular/CNN"
+
+# Prefer currently activated venv; fallback to project-local .venv.
+if [ -n "$VIRTUAL_ENV" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    PYTHON="$VIRTUAL_ENV/bin/python"
+elif [ -x "$CNN_DIR/.venv/bin/python" ]; then
+    PYTHON="$CNN_DIR/.venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+echo "🐍 Using Python: $PYTHON"
 export PYTHONPATH="$CNN_DIR:$PYTHONPATH"
 
 clear
@@ -26,8 +36,10 @@ case $choice in
         echo ""
         echo "📹 Starting Camera Detection..."
         echo ""
+        read -p "Enter camera ID [default: 3]: " cam_id
+        cam_id=${cam_id:-3}
         cd "$CNN_DIR/inference"
-        $PYTHON camera_inference.py --camera 4
+        $PYTHON camera_inference.py --camera "$cam_id"
         ;;
     
     2)

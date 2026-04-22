@@ -112,19 +112,78 @@ class _MiDaSBackend:
         return "MiDaS-Small-PyTorch"
 
 
+class _DA2CheckpointBackend:
+    """Depth Anything V2 checkpoint backend (PyTorch, fine-tuned .pt)."""
+
+    def __init__(self, ckpt_path: Path, device: str = "cuda"):
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.ckpt_path = ckpt_path
+
+        model_dir = CNN_DIR / "models" / "depth_anything_v2"
+        self.processor = AutoImageProcessor.from_pretrained(str(model_dir))
+        self.model = AutoModelForDepthEstimation.from_pretrained(str(model_dir))
+
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+
+        self.model.to(self.device).eval()
+        print(
+            f"✅ [DepthLite] DA2 PT checkpoint loaded ({ckpt_path.name}) "
+            f"on {self.device}  missing={len(missing)} unexpected={len(unexpected)}"
+        )
+
+    def infer(self, frame_bgr: np.ndarray) -> np.ndarray:
+        import torch
+        import torch.nn.functional as F
+
+        h_orig, w_orig = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        inputs = self.processor(images=rgb, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            out = self.model(**inputs)
+            depth = out.predicted_depth.float()
+            depth = F.interpolate(
+                depth.unsqueeze(1),
+                size=(h_orig, w_orig),
+                mode="bilinear",
+                align_corners=True,
+            ).squeeze(1).squeeze(0)
+
+        return depth.cpu().numpy().astype(np.float32)
+
+    @property
+    def name(self) -> str:
+        return f"DA2-KITTI-PT({self.ckpt_path.name})"
+
+
 class _MiDaSOnNXBackend:
-    """MiDaS v2.1 Small ONNX Runtime backend (primary Jetson backend)."""
+    """ONNX Runtime depth backend (MiDaS / DA2 metric)."""
 
     def __init__(self, onnx_path: Path, input_h: int, input_w: int):
         import onnxruntime as ort
+        self.model_name = onnx_path.name
         self.h = input_h
         self.w = input_w
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.sess = ort.InferenceSession(str(onnx_path), providers=providers)
+        self.input_name = self.sess.get_inputs()[0].name
+
+        # Some exports (e.g., DA2 metric) are fixed-shape; respect model shape.
+        # Fallback to provided input_h/input_w when shape is dynamic.
+        in_shape = self.sess.get_inputs()[0].shape
+        if len(in_shape) == 4 and isinstance(in_shape[2], int) and isinstance(in_shape[3], int):
+            self.h, self.w = int(in_shape[2]), int(in_shape[3])
+
         # Check which provider was actually used
         used = self.sess.get_providers()[0]
-        print(f"✅ [DepthLite] MiDaS ONNX loaded  provider={used}  "
-              f"input={input_h}×{input_w}")
+        print(f"✅ [DepthLite] ONNX depth loaded ({onnx_path.name})  provider={used}  "
+              f"input={self.h}×{self.w}")
 
     def _preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -134,7 +193,7 @@ class _MiDaSOnNXBackend:
 
     def infer(self, frame_bgr: np.ndarray) -> np.ndarray:
         inp = self._preprocess(frame_bgr)
-        out = self.sess.run(None, {"image": inp})[0]  # (1, H, W) or (H, W)
+        out = self.sess.run(None, {self.input_name: inp})[0]  # (1, H, W) or (1,1,H,W)
         depth = out.squeeze().astype(np.float32)
         # Resize back to original frame size
         h_orig, w_orig = frame_bgr.shape[:2]
@@ -145,7 +204,7 @@ class _MiDaSOnNXBackend:
 
     @property
     def name(self) -> str:
-        return "MiDaS-Small-ONNX"
+        return f"ONNX-{self.model_name}"
 
 
 class _MiDaSTRTBackend:
@@ -259,8 +318,10 @@ class AsyncDepthLite:
     Backend selection order (auto):
         TRT engine  → ONNX runtime  → PyTorch  → Fallback
 
-    The depth map is RELATIVE, not metric. camera_inference.py's
-    DepthCalibrator will recover metric scale using known-height anchors.
+    For classic MiDaS backends, output is RELATIVE and is converted to
+    pseudo-metric in the worker.
+    For fine-tuned metric ONNX models (e.g., da2_kitti_metric.onnx),
+    set metric_output=True to return metric metres directly.
 
     Args:
         backend  : 'auto' | 'trt' | 'onnx' | 'pytorch' | 'fallback'
@@ -279,12 +340,16 @@ class AsyncDepthLite:
         input_h: int = JETSON_NANO_H,
         input_w: int = JETSON_NANO_W,
         update_interval_frames: int = 5,
+        model_path: Optional[str] = None,
+        metric_output: bool = False,
     ):
         self.device = device
         self.input_h = input_h
         self.input_w = input_w
         self.update_interval_frames = update_interval_frames
         self.frame_counter = 0
+        self.model_path = Path(model_path) if model_path else None
+        self.metric_output = metric_output
 
         self._model = self._load_backend(backend)
 
@@ -300,7 +365,8 @@ class AsyncDepthLite:
         self._thread.start()
         print(f"✅ [AsyncDepthLite] backend={self._model.name}  "
               f"interval={update_interval_frames} frames  "
-              f"input={input_h}×{input_w}")
+              f"input={self.input_h}×{self.input_w}  "
+              f"metric_output={self.metric_output}")
 
     # ── Backend loader ────────────────────────────────────────────────────────
     @staticmethod
@@ -314,6 +380,25 @@ class AsyncDepthLite:
 
     def _load_backend(self, backend: str):
         import torch
+
+        # Explicit custom model path (used by camera_inference metric model fallback)
+        if self.model_path is not None:
+            if self.model_path.suffix.lower() == ".onnx":
+                if backend not in ("onnx", "auto"):
+                    raise ValueError("ONNX model_path requires backend='onnx' or 'auto'")
+                if not self.model_path.exists():
+                    raise FileNotFoundError(f"Depth ONNX model not found: {self.model_path}")
+                return _MiDaSOnNXBackend(self.model_path, self.input_h, self.input_w)
+            if self.model_path.suffix.lower() == ".pt":
+                if backend not in ("pytorch", "auto"):
+                    raise ValueError("PT model_path requires backend='pytorch' or 'auto'")
+                if not self.model_path.exists():
+                    raise FileNotFoundError(f"Depth PT checkpoint not found: {self.model_path}")
+                return _DA2CheckpointBackend(self.model_path, self.device)
+            if not self.model_path.exists():
+                raise FileNotFoundError(f"Depth model not found: {self.model_path}")
+            raise ValueError(f"Unsupported model_path suffix: {self.model_path.suffix}")
+
         # When the host has a CUDA GPU but only CPU onnxruntime is installed,
         # PyTorch-GPU is 5-10× faster than ONNX-CPU.  Reorder 'auto' accordingly.
         if backend == "auto":
@@ -366,27 +451,27 @@ class AsyncDepthLite:
                 self.total_inference_time += elapsed
                 self.last_depth_map = depth
 
-                # Normalise to a scale that DepthCalibrator can work with
-                # MiDaS outputs inverse-depth (larger = closer).
-                # Convert to pseudo-metric: depth_m = scale / midas_value
-                # The scale will be calibrated dynamically by DepthCalibrator.
-                # We invert and scale to roughly 0.5–50 m range.
-                d_min, d_max = depth.min(), depth.max()
-                if d_max > d_min:
-                    # Invert & normalise to [1, 50] m pseudo-metric
-                    depth_norm = (depth - d_min) / (d_max - d_min + 1e-6)
-                    depth_pseudo = 50.0 - depth_norm * 49.0  # close → small value
+                if self.metric_output:
+                    # DA2/MiDaS-KITTI metric ONNX already outputs metres.
+                    depth_out = np.clip(depth.astype(np.float32), 0.1, 100.0)
                 else:
-                    depth_pseudo = np.ones_like(depth) * 5.0
+                    # Normalise relative inverse-depth to pseudo-metric.
+                    d_min, d_max = depth.min(), depth.max()
+                    if d_max > d_min:
+                        # Invert & normalise to [1, 50] m pseudo-metric
+                        depth_norm = (depth - d_min) / (d_max - d_min + 1e-6)
+                        depth_out = 50.0 - depth_norm * 49.0  # close → small value
+                    else:
+                        depth_out = np.ones_like(depth) * 5.0
 
                 try:
                     self.output_queue.put(
-                        (depth_pseudo, elapsed), block=False)
+                        (depth_out, elapsed), block=False)
                 except queue.Full:
                     try:
                         self.output_queue.get_nowait()
                         self.output_queue.put(
-                            (depth_pseudo, elapsed), block=False)
+                            (depth_out, elapsed), block=False)
                     except queue.Empty:
                         pass
             except Exception as e:
