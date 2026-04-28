@@ -1,0 +1,92 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+
+# Large Model Files (Pre-trained weights)
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.bin
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+
+# Dataset and Data Files
+dataset/
+calibration_data/
+test_data/
+testing\ video/
+*.mp4
+*.avi
+*.mov
+
+# Logs and Outputs
+logs/
+*.log
+results/
+output/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Compiled Extensions
+*.so
+*.out
+
+# Package files
+*.whl
+*.tar.gz
+
+# VS Code specific
+.vscode/settings.json
+.vscode/launch.json
+.vscode/extensions.json
