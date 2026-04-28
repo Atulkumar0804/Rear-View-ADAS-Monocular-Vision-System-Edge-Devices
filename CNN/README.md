@@ -43,6 +43,31 @@ python inference/camera_inference.py --camera 0
 python inference/video_inference.py --input video.mp4 --output result.mp4
 ```
 
+**Mobile Web Access (NEW!):**
+```bash
+bash start_web_server.sh
+```
+
+Then access from any device on your network: `http://<your-pc-ip>:5000`
+
+See [MOBILE_QUICK_START.md](MOBILE_QUICK_START.md) for detailed setup instructions.
+
+## 📱 Mobile Access Features
+
+✨ **Web-based interface** for real-time ADAS monitoring
+- Live camera stream with detection overlay
+- Real-time statistics (FPS, inference time, detections)
+- Safety assessment with color-coded indicators
+- Vehicle distance and class predictions
+- Support for mobile devices, tablets, and desktops
+
+🚀 **Quick Start:**
+1. `bash start_web_server.sh` (on PC)
+2. Open `http://<pc-ip>:5000` (on mobile)
+3. Click "Start Camera" and watch detection in real-time
+
+📖 Full documentation: [MOBILE_QUICK_START.md](MOBILE_QUICK_START.md)
+
 ## 🧠 Pipeline Logic
 
 1.  **Stage 1 (Detection):** `yolo11x-seg.pt` detects Persons and generic Vehicles.
