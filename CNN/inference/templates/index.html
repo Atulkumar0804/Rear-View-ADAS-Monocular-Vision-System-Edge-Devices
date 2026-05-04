@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rear-View ADAS Web Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+
+        header h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 15px;
+        }
+
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: bold;
+        }
+
+        .btn-start {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .btn-start:hover {
+            background: #45a049;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+
+        .btn-stop {
+            background: #f44336;
+            color: white;
+        }
+
+        .btn-stop:hover {
+            background: #da190b;
+            transform: translateY(-2px);
+        }
+
+        .btn-upload {
+            background: #2196F3;
+            color: white;
+        }
+
+        .btn-upload:hover {
+            background: #0b7dda;
+        }
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 18px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        #videoStream {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .video-loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 18px;
+            text-align: center;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            opacity: 0.9;
+            margin-bottom: 5px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: bold;
+        }
+
+        .detections-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .detection-item {
+            background: #f5f5f5;
+            padding: 12px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            border-left: 4px solid #667eea;
+        }
+
+        .detection-class {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+
+        .detection-details {
+            font-size: 12px;
+            color: #666;
+        }
+
+        .detection-details span {
+            display: inline-block;
+            margin-right: 15px;
+        }
+
+        .safety-level {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+
+        .safety-critical {
+            background: #ffebee;
+            color: #c62828;
+        }
+
+        .safety-warning {
+            background: #fff3e0;
+            color: #e65100;
+        }
+
+        .safety-caution {
+            background: #fffde7;
+            color: #f57f17;
+        }
+
+        .safety-safe {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .upload-area {
+            border: 2px dashed #667eea;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #f0f7ff;
+        }
+
+        .upload-area:hover {
+            background: #e3f2fd;
+            border-color: #764ba2;
+        }
+
+        .upload-area.dragover {
+            background: #e3f2fd;
+            border-color: #764ba2;
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+
+        #fileInput {
+            display: none;
+        }
+
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #f5f5f5;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ccc;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.running {
+            background: #4CAF50;
+        }
+
+        .status-dot.stopped {
+            background: #f44336;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.7;
+            }
+        }
+
+        .error {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            display: none;
+        }
+
+        .success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            display: none;
+        }
+
+        footer {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            color: #666;
+            font-size: 12px;
+            margin-top: 20px;
+        }
+
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚗 Rear-View ADAS Web Dashboard</h1>
+            <p>Real-time vehicle detection and safety assessment via mobile camera</p>
+            
+            <div class="controls">
+                <button class="btn-start" onclick="startCamera()">
+                    <span id="startBtnText">▶ Start Camera</span>
+                </button>
+                <button class="btn-stop" onclick="stopCamera()">⏹ Stop Camera</button>
+                <button class="btn-upload" onclick="uploadVideo()">📤 Upload Video</button>
+                <div class="status-indicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Offline</span>
+                </div>
+            </div>
+        </header>
+
+        <div id="errorMsg" class="error"></div>
+        <div id="successMsg" class="success"></div>
+
+        <div class="dashboard">
+            <!-- Video Stream -->
+            <div class="card">
+                <h2>📹 Live Camera Feed</h2>
+                <div class="video-container">
+                    <img id="videoStream" src="/api/video/stream" alt="Video Stream" style="display:none;">
+                    <div id="videoLoading" class="video-loading">
+                        <div class="loading-spinner" style="margin: 0 auto; margin-bottom: 10px;"></div>
+                        <p>Starting camera...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Statistics -->
+            <div class="card">
+                <h2>📊 Statistics</h2>
+                <div class="stats">
+                    <div class="stat-item">
+                        <div class="stat-label">FPS</div>
+                        <div class="stat-value" id="fpsStat">0</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Total Detections</div>
+                        <div class="stat-value" id="totalDetectStat">0</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Avg Inference Time</div>
+                        <div class="stat-value" id="inferenceTimeStat">0ms</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Frames Processed</div>
+                        <div class="stat-value" id="frameCountStat">0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🎯 Current Detections</h2>
+            <div class="detections-list" id="detectionsList">
+                <p style="color: #999; text-align: center;">No detections yet. Start camera to begin.</p>
+            </div>
+        </div>
+
+        <div class="dashboard">
+            <!-- File Upload -->
+            <div class="card">
+                <h2>📁 Upload & Process</h2>
+                <div class="upload-area" id="uploadArea" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="document.getElementById('fileInput').click()">
+                    <div class="upload-icon">📂</div>
+                    <p>Drop video/image here or click to browse</p>
+                    <small>Supported: MP4, AVI, JPG, PNG</small>
+                </div>
+                <input type="file" id="fileInput" accept="video/*,image/*" onchange="handleFileSelect(event)">
+            </div>
+
+            <!-- Configuration -->
+            <div class="card">
+                <h2>⚙️ Configuration</h2>
+                <div style="font-size: 14px;">
+                    <p><strong>Vehicle Classes:</strong> <span id="vehicleClasses">Loading...</span></p>
+                    <p style="margin-top: 10px;"><strong>Confidence Threshold:</strong> <span id="confThreshold">Loading...</span></p>
+                    <button class="btn-start" onclick="loadConfig()" style="margin-top: 10px;">🔄 Reload Config</button>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <p>Rear-View ADAS © 2026 | Real-time Vehicle Detection & Safety Assessment</p>
+            <p style="margin-top: 5px;">For mobile access, open: <strong>http://your-pc-ip:5000</strong></p>
+        </footer>
+    </div>
+
+    <script>
+        const API_BASE = '/api';
+        let updateInterval = null;
+        let cameraRunning = false;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            loadStatus();
+            loadConfig();
+            startStatusUpdates();
+        });
+
+        // Start Camera
+        function startCamera() {
+            const btn = document.querySelector('.btn-start');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading-spinner"></span> Starting...';
+
+            fetch(`${API_BASE}/camera/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ camera_index: 0 })
+            })
+            .then(res => res.json())
+            .then(data => {
+                showSuccess('Camera started successfully!');
+                cameraRunning = true;
+                document.getElementById('videoStream').style.display = 'block';
+                document.getElementById('videoLoading').style.display = 'none';
+                updateStatus();
+                btn.disabled = false;
+                btn.innerHTML = '▶ Start Camera';
+            })
+            .catch(err => {
+                showError('Failed to start camera: ' + err.message);
+                btn.disabled = false;
+                btn.innerHTML = '▶ Start Camera';
+            });
+        }
+
+        // Stop Camera
+        function stopCamera() {
+            fetch(`${API_BASE}/camera/stop`, { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+                showSuccess('Camera stopped');
+                cameraRunning = false;
+                updateStatus();
+            })
+            .catch(err => showError('Failed to stop camera: ' + err.message));
+        }
+
+        // Load Status
+        function loadStatus() {
+            fetch(`${API_BASE}/status`)
+            .then(res => res.json())
+            .then(data => {
+                cameraRunning = data.status === 'running';
+                updateStatusIndicator();
+            })
+            .catch(err => console.error('Status error:', err));
+        }
+
+        // Update Status Indicator
+        function updateStatusIndicator() {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            
+            if (cameraRunning) {
+                dot.classList.add('running');
+                dot.classList.remove('stopped');
+                text.textContent = 'Running';
+            } else {
+                dot.classList.add('stopped');
+                dot.classList.remove('running');
+                text.textContent = 'Stopped';
+            }
+        }
+
+        // Update Statistics
+        function updateStatus() {
+            fetch(`${API_BASE}/status`)
+            .then(res => res.json())
+            .then(data => {
+                const stats = data.stats;
+                document.getElementById('fpsStat').textContent = stats.fps.toFixed(1);
+                document.getElementById('totalDetectStat').textContent = stats.total_detections;
+                document.getElementById('inferenceTimeStat').textContent = (stats.avg_inference_time * 1000).toFixed(1) + 'ms';
+                document.getElementById('frameCountStat').textContent = stats.total_frames;
+            });
+
+            // Load detections
+            fetch(`${API_BASE}/detections`)
+            .then(res => res.json())
+            .then(data => {
+                updateDetectionsList(data.detections || []);
+            });
+        }
+
+        // Update Detections List
+        function updateDetectionsList(detections) {
+            const list = document.getElementById('detectionsList');
+            
+            if (!detections || detections.length === 0) {
+                list.innerHTML = '<p style="color: #999; text-align: center;">No detections</p>';
+                return;
+            }
+
+            let html = '';
+            detections.forEach((det, idx) => {
+                const safetyClass = det.safety_level ? `safety-${det.safety_level.toLowerCase()}` : '';
+                const safetyText = det.safety_level || 'UNKNOWN';
+                
+                html += `
+                    <div class="detection-item">
+                        <div class="detection-class">${det.class}</div>
+                        <div class="detection-details">
+                            <span>Confidence: ${(det.confidence * 100).toFixed(1)}%</span>
+                            ${det.distance ? `<span>Distance: ${det.distance.toFixed(1)}m</span>` : ''}
+                        </div>
+                        <span class="safety-level ${safetyClass}">${safetyText}</span>
+                    </div>
+                `;
+            });
+            
+            list.innerHTML = html;
+        }
+
+        // Load Configuration
+        function loadConfig() {
+            fetch(`${API_BASE}/config`)
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('vehicleClasses').textContent = data.vehicle_classes.join(', ');
+                document.getElementById('confThreshold').textContent = (data.confidence_threshold * 100).toFixed(0) + '%';
+            });
+        }
+
+        // Start Status Updates
+        function startStatusUpdates() {
+            updateInterval = setInterval(updateStatus, 500);
+        }
+
+        // File Upload
+        function uploadVideo() {
+            document.getElementById('fileInput').click();
+        }
+
+        function handleFileSelect(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('video', file);
+
+            fetch(`${API_BASE}/upload/video`, {
+                method: 'POST',
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                showSuccess(`File uploaded: ${data.filename}`);
+            })
+            .catch(err => showError('Upload failed: ' + err.message));
+        }
+
+        // Drag & Drop
+        function handleDragOver(e) {
+            e.preventDefault();
+            document.getElementById('uploadArea').classList.add('dragover');
+        }
+
+        function handleDragLeave(e) {
+            document.getElementById('uploadArea').classList.remove('dragover');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            document.getElementById('uploadArea').classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                const file = files[0];
+                const formData = new FormData();
+                formData.append('video', file);
+
+                fetch(`${API_BASE}/upload/video`, {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(res => res.json())
+                .then(data => showSuccess(`File uploaded: ${data.filename}`))
+                .catch(err => showError('Upload failed'));
+            }
+        }
+
+        // Notifications
+        function showError(message) {
+            const el = document.getElementById('errorMsg');
+            el.textContent = '❌ ' + message;
+            el.style.display = 'block';
+            setTimeout(() => el.style.display = 'none', 5000);
+        }
+
+        function showSuccess(message) {
+            const el = document.getElementById('successMsg');
+            el.textContent = '✅ ' + message;
+            el.style.display = 'block';
+            setTimeout(() => el.style.display = 'none', 5000);
+        }
+    </script>
+</body>
+</html>

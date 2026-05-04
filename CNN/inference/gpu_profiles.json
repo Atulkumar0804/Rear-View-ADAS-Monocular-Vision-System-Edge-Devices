@@ -1,0 +1,94 @@
+{
+  "profiles": {
+    "a6000_full": {
+      "description": "Full RTX A6000 performance - no restrictions",
+      "hardware": {
+        "ai_performance_tops": 1458,
+        "cuda_cores": 7680,
+        "memory_gb": 48,
+        "power_max_w": 300
+      },
+      "inference_settings": {
+        "batch_size": 32,
+        "model_precision": "float32",
+        "enable_tf32": true,
+        "num_workers": 8,
+        "pin_memory": true,
+        "prefetch_factor": 2
+      },
+      "optimization": {
+        "use_cudnn_autotuner": true,
+        "compile_model": true,
+        "fused_operations": true,
+        "mixed_precision": false,
+        "quantization": "none"
+      },
+      "model_choice": {
+        "yolo_model": "yolo11x",
+        "depth_model": "zoedepth_nk",
+        "classifier_model": "large",
+        "tracker": "byte_tracker_full"
+      }
+    },
+    "jetson_nano_restricted": {
+      "description": "Simulates Jetson Nano Super constraints",
+      "hardware": {
+        "ai_performance_tops": 67,
+        "cuda_cores": 1024,
+        "memory_gb": 8,
+        "power_max_w": 25
+      },
+      "inference_settings": {
+        "batch_size": 4,
+        "model_precision": "float16",
+        "enable_tf32": false,
+        "num_workers": 2,
+        "pin_memory": true,
+        "prefetch_factor": 1
+      },
+      "optimization": {
+        "use_cudnn_autotuner": false,
+        "compile_model": false,
+        "fused_operations": true,
+        "mixed_precision": true,
+        "quantization": "int8"
+      },
+      "model_choice": {
+        "yolo_model": "yolo11n",
+        "depth_model": "midas_small",
+        "classifier_model": "small",
+        "tracker": "byte_tracker_lite"
+      }
+    },
+    "jetson_nano_power_save": {
+      "description": "Jetson Nano at minimum power (7W)",
+      "hardware": {
+        "ai_performance_tops": 35,
+        "cuda_cores": 512,
+        "memory_gb": 8,
+        "power_max_w": 7
+      },
+      "inference_settings": {
+        "batch_size": 1,
+        "model_precision": "float16",
+        "enable_tf32": false,
+        "num_workers": 1,
+        "pin_memory": false,
+        "prefetch_factor": 0
+      },
+      "optimization": {
+        "use_cudnn_autotuner": false,
+        "compile_model": false,
+        "fused_operations": false,
+        "mixed_precision": false,
+        "quantization": "int8"
+      },
+      "model_choice": {
+        "yolo_model": "yolo11n",
+        "depth_model": "midas_small_lite",
+        "classifier_model": "nano",
+        "tracker": "centroid_tracker"
+      }
+    }
+  }
+}
