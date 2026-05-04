@@ -69,17 +69,51 @@ case $choice in
         echo ""
         echo "📹 Starting Camera Detection with GPU Profile: $GPU_PROFILE"
         echo ""
-        read -p "Enter camera ID [default: 0]: " cam_id
-        cam_id=${cam_id:-0}
+        echo "  1. 📷 RealSense D455 Camera (Recommended)"
+        echo "  2. 🎥 USB Camera"
+        echo "  3. 📹 Test Video (Fallback)"
         echo ""
-        echo "🚀 Running inference_with_gpu_config.py with profile: $GPU_PROFILE"
-        echo ""
+        read -p "Select camera source [1-3, default: 1]: " cam_choice
+        cam_choice=${cam_choice:-1}
         
-        cd "$CNN_DIR"
-        $PYTHON inference/inference_with_gpu_config.py camera \
-            --profile "$GPU_PROFILE" \
-            --camera "$cam_id" \
-            -v
+        case $cam_choice in
+            1)
+                echo ""
+                echo "🚀 Running with RealSense D455 camera..."
+                cd "$CNN_DIR"
+                $PYTHON inference/camera_inference.py \
+                    --profile "$GPU_PROFILE" \
+                    --realsense \
+                    --save "detection_output_realsense.mp4" \
+                    -v
+                ;;
+            2)
+                read -p "Enter camera ID [default: 0]: " cam_id
+                cam_id=${cam_id:-0}
+                echo ""
+                echo "🚀 Running with USB camera..."
+                cd "$CNN_DIR"
+                $PYTHON inference/camera_inference.py \
+                    --profile "$GPU_PROFILE" \
+                    --camera "$cam_id" \
+                    --save "detection_output_usb.mp4" \
+                    -v
+                ;;
+            3)
+                echo ""
+                echo "🚀 Running with test video..."
+                cd "$CNN_DIR"
+                $PYTHON inference/camera_inference.py \
+                    --profile "$GPU_PROFILE" \
+                    --camera "testing_data/IISc _Road.mp4" \
+                    --save "detection_output_test.mp4" \
+                    -v
+                ;;
+            *)
+                echo "❌ Invalid camera choice"
+                exit 1
+                ;;
+        esac
         ;;
     
     2)
@@ -96,14 +130,14 @@ case $choice in
         echo "   Input: $video_path"
         echo "   Output: $output"
         echo ""
-        echo "🚀 Running inference_with_gpu_config.py with profile: $GPU_PROFILE"
+        echo "🚀 Running video inference..."
         echo ""
         
         cd "$CNN_DIR"
-        $PYTHON inference/inference_with_gpu_config.py video \
+        $PYTHON inference/camera_inference.py \
             --profile "$GPU_PROFILE" \
-            --input "$video_path" \
-            --output "$output" \
+            --camera "$video_path" \
+            --save "$output" \
             -v
         ;;
     

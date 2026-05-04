@@ -447,15 +447,42 @@ def internal_error(error):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Web Server for Camera Inference')
     parser.add_argument('--port', type=int, default=5000, help='Port to run server on')
-    parser.add_argument('--host', default='127.0.0.1', help='Host address')
+    parser.add_argument('--host', default='0.0.0.0', help='Host address')
     parser.add_argument('--camera', type=int, default=0, help='Camera index')
     parser.add_argument('--auto-start', action='store_true', help='Auto-start camera on startup')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--ssl-cert', help='Path to SSL certificate file')
+    parser.add_argument('--ssl-key', help='Path to SSL key file')
+
+
+def create_app(gpu_profile: str = None):
+    """
+    Create and return Flask app instance
     
+    Args:
+        gpu_profile: GPU profile name (for logging/context)
+        
+    Returns:
+        Flask app instance
+    """
+    global app
+    if gpu_profile:
+        logger.info(f"Created web app instance for GPU profile: {gpu_profile}")
+    return app
+
+
+if __name__ == '__main__':
     args = parser.parse_args()
     
-    logger.info(f"Starting Web Server on {args.host}:{args.port}")
-    logger.info(f"Access from mobile: http://{args.host}:{args.port}")
+    # Prepare SSL context if certificates provided
+    ssl_context = None
+    protocol = 'http'
+    if args.ssl_cert and args.ssl_key:
+        ssl_context = (args.ssl_cert, args.ssl_key)
+        protocol = 'https'
+    
+    logger.info(f"Starting Web Server on {protocol}://{args.host}:{args.port}")
+    logger.info(f"Access from mobile: {protocol}://{args.host}:{args.port}")
     
     # Auto-start camera if requested
     if args.auto_start:
@@ -466,4 +493,7 @@ if __name__ == '__main__':
         logger.info("Auto-started camera")
     
     # Run Flask app
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
+    if ssl_context:
+        app.run(host=args.host, port=args.port, debug=args.debug, threaded=True, ssl_context=ssl_context)
+    else:
+        app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)

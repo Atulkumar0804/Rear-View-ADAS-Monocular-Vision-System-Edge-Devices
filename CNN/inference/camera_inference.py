@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-Real-time Camera Inference for Vehicle Detection with Advanced ADAS
-Integrates advanced logic from video_inference.py while maintaining live camera feed focus.
+Real-time Camera Inference with Advanced ADAS Features
+Fully integrated with all features from video_inference.py for live camera feed
 
-Key Features Integrated:
-1. DynamicHorizonEstimator - Adaptive horizon detection using vanishing points
-2. LaneDetector - Lane-aware vehicle positioning logic
-3. RiderActionRecommendation - Natural language action recommendations
-4. RearViewSafetyAssessment - SSM-based safety metrics (TTC, MTTC, PET, DRAC)
-5. RearSideUseCaseValidator - Validation logic for rear-view ADAS
-6. ByteTracker integration - Improved motion-aware tracking
-7. Dual-Depth Fusion - Classical + ML depth estimation with learnable correction
-8. Kalman Filters - For distance smoothing per track
-9. Horizon-aware distance estimation - Ground plane projection with dynamic horizon
+KEY FEATURES:
+1. Dynamic Horizon Estimation - Adapts to camera suspension movement
+2. ByteTracker + IoU Fallback - Motion-aware tracking
+3. Dual-Depth Fusion - Classical + ML depth estimation
+4. Lane-Aware Safety Assessment - SSM-based metrics (TTC, MTTC, PET, DRAC)
+5. Rider Action Recommendations - Natural language instructions
+6. RearViewSafetyAssessment - Comprehensive safety metrics
+7. RearSideUseCaseValidator - Validation logic for rear-view ADAS
 
 Usage:
     python camera_inference.py --camera 0 --rear-camera
-    python camera_inference.py --camera video.mp4 --hybrid-depth --zoedepth-interval 30
-
+    python camera_inference.py --camera video.mp4 --hybrid-depth
 """
 
 import torch
@@ -39,7 +36,7 @@ from queue import Queue
 from collections import deque, defaultdict
 import math
 
-# Add scripts directory to path for ZoeDepth loader
+# Add scripts directory to path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CNN_DIR = SCRIPT_DIR.parent
 sys.path.append(str(CNN_DIR))
@@ -47,18 +44,16 @@ sys.path.append(str(CNN_DIR))
 from scripts.zoedepth_loader import load_zoedepth_model
 from ultralytics import YOLO
 
-# Lightweight depth for Jetson (lazy import – only when --jetson flag is used)
+# Import GPU configuration
 try:
-    from inference.jetson_depth_lite import AsyncDepthLite
-    _DEPTH_LITE_AVAILABLE = True
+    from inference.gpu_config import GPUConfigManager, setup_gpu
+    from inference.model_optimizer import ModelOptimizer, InferenceOptimizer
+    _GPU_CONFIG_AVAILABLE = True
 except ImportError:
-    try:
-        from jetson_depth_lite import AsyncDepthLite
-        _DEPTH_LITE_AVAILABLE = True
-    except ImportError:
-        _DEPTH_LITE_AVAILABLE = False
+    _GPU_CONFIG_AVAILABLE = False
+    print("⚠️  GPU configuration not available, running with default settings")
 
-# Import ByteTracker (improved tracking over IoU)
+# Import ByteTracker
 try:
     from inference.byte_tracker import ByteTracker
     _BYTE_TRACKER_AVAILABLE = True
@@ -70,142 +65,39 @@ except ImportError:
         _BYTE_TRACKER_AVAILABLE = False
         print("⚠️  ByteTracker not available, will fall back to IoU tracking")
 
-# Try to import transformers for Depth Anything (Legacy, now using ZoeDepth)
+# Import AsyncDepthLite
 try:
-    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-    TRANSFORMERS_AVAILABLE = True
+    from inference.jetson_depth_lite import AsyncDepthLite
+    _DEPTH_LITE_AVAILABLE = True
 except ImportError:
-    TRANSFORMERS_AVAILABLE = False
+    try:
+        from jetson_depth_lite import AsyncDepthLite
+        _DEPTH_LITE_AVAILABLE = True
+    except ImportError:
+        _DEPTH_LITE_AVAILABLE = False
 
-# Get absolute path to YOLO model
-SCRIPT_DIR = Path(__file__).parent.resolve()
-CNN_DIR = SCRIPT_DIR.parent
-# Default heavy model
-YOLO_MODEL_PATH_HEAVY = str(CNN_DIR / "models/yolo/yolo11x-seg.pt")
-# Default fast model (will be downloaded if not present)
+# YOLO Models
 YOLO_MODEL_PATH_FAST = "yolo11n.pt"
-
-# Jetson Nano / Orin ONNX & TRT model paths
-YOLO_ONNX_JETSON = str(CNN_DIR / "models/yolo/yolo11n_jetson.onnx")
-YOLO_TRT_JETSON  = str(CNN_DIR / "models/yolo/yolo11n_jetson_fp16.engine")
-CLS_ONNX_JETSON  = str(CNN_DIR / "models/classifier/weights/best_jetson.onnx")
-CLS_TRT_JETSON   = str(CNN_DIR / "models/classifier/weights/best_jetson_fp16.engine")
+YOLO_MODEL_PATH_HEAVY = str(CNN_DIR / "models/yolo/yolo11x-seg.pt")
 
 # Configuration
 IMG_SIZE = (224, 224)
 CONFIDENCE_THRESHOLD = 0.4
-FIXED_DEPTH_SCALE = 950.0 
-
-CLASS_DEPTH_MULTIPLIERS: dict = {}
+FOCAL_LENGTH = 721.5377
 
 # Camera intrinsic constants
 KITTI_FX      = 721.5377
 KITTI_FY      = 721.5377
 KITTI_CX      = 609.5593
 KITTI_CY      = 172.854
-FOCAL_LENGTH = KITTI_FX
 
-# Preferred metric-depth model paths
-METRIC_DEPTH_MODEL_PATHS = [
-    CNN_DIR / "models" / "depth_lite" / "da2_kitti_metric.onnx",
-    CNN_DIR / "models" / "depth_lite" / "midas_kitti_metric.onnx",
-    CNN_DIR / "models" / "depth_lite" / "midas_small.onnx",
-]
+# Rear camera parameters
+MOUNTING_HEIGHT_M = 1.1
+GROUND_PLANE_RATIO = 0.55
+DEPTH_CLIP_MIN_M = 0.5
+DEPTH_CLIP_MAX_M = 25.0
 
-# Calibration Data
-CAMERA_MATRIX = None
-DIST_COEFFS = None
-METRIC_DEPTH_SCALE = 1.0
-
-# Try to load calibration data
-CALIB_DIR = CNN_DIR / "calibration_data"
-try:
-    if (CALIB_DIR / "camera_matrix.npy").exists() and (CALIB_DIR / "dist_coeffs.npy").exists():
-        CAMERA_MATRIX = np.load(CALIB_DIR / "camera_matrix.npy")
-        DIST_COEFFS = np.load(CALIB_DIR / "dist_coeffs.npy")
-        FOCAL_LENGTH = float((CAMERA_MATRIX[0, 0] + CAMERA_MATRIX[1, 1]) / 2.0)
-        print(f"✅ Loaded Camera Calibration. Focal Length: {FOCAL_LENGTH:.1f}")
-    else:
-        print(f"ℹ️  calibration_data/ absent — using KITTI fallback focal length {FOCAL_LENGTH:.1f} px")
-
-    if (CALIB_DIR / "depth_config.json").exists():
-        with open(CALIB_DIR / "depth_config.json", 'r') as f:
-            config = json.load(f)
-            METRIC_DEPTH_SCALE = config.get("metric_depth_scale", 1.0)
-            print(f"✅ Loaded Depth Scale: {METRIC_DEPTH_SCALE:.3f}")
-except Exception as e:
-    print(f"⚠️ Failed to load calibration data: {e}")
-
-# Structured Logging Setup
-_log_dir = CNN_DIR / "logs"
-_log_dir.mkdir(exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.handlers.RotatingFileHandler(
-            str(_log_dir / "adas.log"),
-            maxBytes=10_000_000,
-            backupCount=5,
-        ),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("ADAS")
-
-# REAR-CAMERA ADAS DOMAIN CONFIGURATION
-REAR_CAMERA_CONFIG = {
-    "mounting_height_m": 0.75,
-    "camera_tilt_deg": -15.0,
-    "fisheye_fov_deg": 170.0,
-    "ground_plane_ratio": 0.65,
-    "bumper_exclusion_ratio": 0.08,
-    "zone_critical_m": 2.0,
-    "zone_danger_m": 5.0,
-    "zone_caution_m": 10.0,
-    "depth_clip_min_m": 0.3,
-    "depth_clip_max_m": 15.0,
-    "side_entry_x_ratio": 0.15,
-    "side_entry_min_height_ratio": 0.05,
-    "confidence_critical_class": 0.35,
-    "confidence_general": 0.40,
-}
-
-# TWO-WHEELER ADAS DOMAIN CONFIGURATION
-TWOWHEELER_CAMERA_CONFIG = {
-    "mounting_height_m": 1.1,
-    "camera_tilt_deg": -5.0,
-    "fisheye_fov_deg": 120.0,
-    "ground_plane_ratio": 0.55,
-    "bumper_exclusion_ratio": 0.0,
-    "zone_critical_m": 3.0,
-    "zone_danger_m": 8.0,
-    "zone_caution_m": 20.0,
-    "depth_clip_min_m": 0.5,
-    "depth_clip_max_m": 25.0,
-    "side_entry_x_ratio": 0.12,
-    "side_entry_min_height_ratio": 0.04,
-    "confidence_critical_class": 0.30,
-    "confidence_general": 0.40,
-    "vibration_compensation": True,
-}
-
-# Safety Classes
-SAFETY_CLASSES = {
-    'Person', 'Bicycle', 'Two-wheeler', 'Sedan', 'Hatchback', 'SUV', 'Bus', 'Truck',
-    'Three-wheeler', 'LCV', 'Van', 'MUV', 'Person + Two-wheeler', 'Person + Bicycle',
-    'Person + Three-wheeler', 'Others',
-}
-
-# Alert zone colors (BGR)
-ALERT_ZONE_COLORS = {
-    'CRITICAL': (0, 0, 255),      # Red
-    'DANGER':   (0, 80, 255),     # Orange-Red
-    'CAUTION':  (0, 165, 255),    # Orange
-    'SAFE':     (0, 200, 0),      # Green
-}
-
-# Vehicle dimensions for distance estimation
+# Vehicle dimensions
 VEHICLE_DIMENSIONS = {
     'Person': (1.7, 0.45, 0.15, 0.35),
     'Bicycle': (1.2, 0.65, 0.1, 0.55),
@@ -304,7 +196,7 @@ class KalmanFilter1D:
 
 
 # ============================================================================
-# DYNAMIC HORIZON ESTIMATION
+# DYNAMIC HORIZON ESTIMATION (Adaptive to Camera Suspension Movement)
 # ============================================================================
 
 class DynamicHorizonEstimator:
@@ -377,7 +269,6 @@ class DynamicHorizonEstimator:
             return self.y_horizon_smoothed, 0.1
             
         except Exception as e:
-            print(f"⚠️  Horizon detection error: {e}")
             return self.y_horizon_smoothed, 0.0
     
     def update(self, frame):
@@ -410,7 +301,7 @@ class DynamicHorizonEstimator:
 
 
 # ============================================================================
-# LANE DETECTION
+# LANE DETECTOR
 # ============================================================================
 
 class LaneDetector:
@@ -511,22 +402,50 @@ class RiderActionRecommendation:
                         'rider_instruction': 'Apply strong brakes immediately!',
                         'reason': f'Collision imminent - vehicle catching up at {relative_speed_kmh:.1f}km/h'
                     }
+                else:
+                    return {
+                        'action': 'STRONG_DECELERATE',
+                        'urgency': 'CRITICAL',
+                        'description': f'⚠️ CRITICAL: Vehicle {distance_m:.1f}m away - reduce speed now!',
+                        'rider_instruction': 'Decelerate aggressively to increase gap.',
+                        'reason': 'Critical collision risk'
+                    }
+            
             elif safety_level == 'WARNING':
                 return {
                     'action': 'DECELERATE',
                     'urgency': 'HIGH',
-                    'description': f'⚠️ WARNING: Vehicle {distance_m:.1f}m away',
+                    'description': f'⚠️ WARNING: Vehicle {distance_m:.1f}m away approaching - reduce speed',
                     'rider_instruction': 'Slow down gradually to maintain safe distance.',
-                    'reason': f'Vehicle approaching at {relative_speed_kmh:.1f}km/h'
+                    'reason': f'Vehicle approaching at {relative_speed_kmh:.1f}km/h, closing gap'
                 }
-            else:
+            
+            elif safety_level == 'CAUTION':
                 return {
-                    'action': 'MAINTAIN_SPEED',
-                    'urgency': 'LOW',
-                    'description': f'✓ Safe: Vehicle {distance_m:.1f}m away',
-                    'rider_instruction': 'Maintain current speed and lane position.',
-                    'reason': 'Safe following distance maintained'
+                    'action': 'MONITOR',
+                    'urgency': 'MEDIUM',
+                    'description': f'ℹ️ CAUTION: Vehicle {distance_m:.1f}m away - monitor distance',
+                    'rider_instruction': 'Reduce speed or maintain safe distance.',
+                    'reason': f'Close following distance - currently {distance_m:.1f}m'
                 }
+            
+            else:  # SAFE
+                if ego_speed_kmh > 60:
+                    return {
+                        'action': 'MAINTAIN_SPEED',
+                        'urgency': 'LOW',
+                        'description': f'✓ SAFE: Vehicle {distance_m:.1f}m away - maintain speed',
+                        'rider_instruction': 'Maintain current speed and distance.',
+                        'reason': 'Safe following distance'
+                    }
+                else:
+                    return {
+                        'action': 'MAINTAIN_SPEED',
+                        'urgency': 'LOW',
+                        'description': f'✓ SAFE: Vehicle {distance_m:.1f}m away',
+                        'rider_instruction': 'Continue at current speed.',
+                        'reason': 'Safe driving distance'
+                    }
         else:
             return {
                 'action': 'BE_AWARE',
@@ -542,13 +461,11 @@ class RiderActionRecommendation:
 # ============================================================================
 
 class RearViewSafetyAssessment:
-    """Rear-View ADAS Safety Assessment based on SSMs"""
+    """Rear-View ADAS Safety Assessment with SSM-based metrics"""
     
     TTC_CRITICAL = 1.0
     TTC_WARNING = 1.5
     TTC_SAFE = 2.5
-    TTC_CRITICAL_ADJACENT = 0.5
-    TTC_WARNING_ADJACENT = 1.0
     PET_CRITICAL = 1.0
     DRAC_CRITICAL = 3.35
     DRAC_WARNING = 2.0
@@ -804,153 +721,6 @@ class RearSideUseCaseValidator:
 
 
 # ============================================================================
-# ASYNC DEPTH LITE
-# ============================================================================
-
-class AsyncZoeDepth:
-    """Asynchronous ZoeDepth Estimation"""
-    
-    def __init__(self, model_path=None, device='cuda', max_queue_size=2, update_interval_frames=30):
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.model_path = model_path or str(CNN_DIR / "models/zoedepth_finetuned/zoedepth_best.pt")
-        self.input_queue = Queue(maxsize=max_queue_size)
-        self.output_queue = Queue(maxsize=max_queue_size)
-        self.running = True
-        self.last_depth_map = None
-        self.inference_count = 0
-        self.total_inference_time = 0.0
-        self.model = None
-        self.update_interval_frames = update_interval_frames
-        self.frame_counter = 0
-        
-        print(f"📦 Loading ZoeDepth from {self.model_path}...")
-        self._load_model()
-        
-        self.worker_thread = threading.Thread(target=self._inference_worker, daemon=True)
-        self.worker_thread.start()
-        print(f"✅ Async ZoeDepth initialized")
-    
-    def _load_model(self):
-        """Load ZoeDepth model"""
-        try:
-            from scripts.zoedepth_loader import load_zoedepth_model
-            
-            print(f"   Loading ZoeDepth base model (ZoeD_K)...")
-            self.model = load_zoedepth_model("ZoeD_K", device=str(self.device))
-            
-            if self.model is None:
-                raise RuntimeError("Failed to load ZoeDepth base model")
-            
-            self.model.to(self.device)
-            self.model.eval()
-            print(f"✅ ZoeDepth loaded successfully")
-            
-        except Exception as e:
-            print(f"❌ Failed to load ZoeDepth: {e}")
-            raise
-    
-    def _inference_worker(self):
-        """Background inference thread"""
-        while self.running:
-            try:
-                frame = self.input_queue.get(timeout=0.1)
-                start_time = time.time()
-                depth_map = self._run_inference(frame)
-                inference_time = time.time() - start_time
-                
-                self.inference_count += 1
-                self.total_inference_time += inference_time
-                
-                try:
-                    self.output_queue.put((depth_map, inference_time), block=False)
-                except queue.Full:
-                    try:
-                        self.output_queue.get_nowait()
-                        self.output_queue.put((depth_map, inference_time), block=False)
-                    except queue.Empty:
-                        pass
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"⚠️ Error in ZoeDepth inference worker: {e}")
-                continue
-    
-    def _run_inference(self, frame: np.ndarray) -> np.ndarray:
-        """Run ZoeDepth inference"""
-        try:
-            h, w = frame.shape[:2]
-            
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            input_tensor = torch.from_numpy(rgb_frame).float().permute(2, 0, 1).unsqueeze(0).to(self.device) / 255.0
-            
-            with torch.no_grad():
-                depth_output = self.model.infer(input_tensor)
-                
-                if isinstance(depth_output, dict):
-                    depth_map = depth_output.get('metric_depth', depth_output.get('depth'))
-                else:
-                    depth_map = depth_output
-                
-                if depth_map.shape[-2:] != (h, w):
-                    depth_map = torch.nn.functional.interpolate(
-                        depth_map.unsqueeze(0) if depth_map.dim() == 2 else depth_map,
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze()
-            
-            depth_map = depth_map.cpu().numpy()
-            depth_map = np.clip(depth_map, 0.1, 100.0).astype(np.float32)
-            
-            self.last_depth_map = depth_map.copy()
-            
-            return depth_map
-            
-        except Exception as e:
-            print(f"⚠️ ZoeDepth inference failed: {e}")
-            if self.last_depth_map is not None:
-                return self.last_depth_map.copy()
-            else:
-                h, w = frame.shape[:2]
-                return np.ones((h, w), dtype=np.float32) * 5.0
-    
-    def request_depth(self, frame: np.ndarray, force: bool = False) -> bool:
-        """Request depth estimation"""
-        self.frame_counter += 1
-        
-        if not force and (self.frame_counter % self.update_interval_frames != 0):
-            return False
-            
-        try:
-            self.input_queue.put(frame.copy(), block=False)
-            return True
-        except queue.Full:
-            return False
-    
-    def get_depth(self, wait: bool = False, timeout: float = 0.01):
-        try:
-            if wait:
-                result = self.output_queue.get(timeout=timeout)
-            else:
-                result = self.output_queue.get_nowait()
-            if result is not None:
-                self.last_depth_map = result[0]
-            return result
-        except queue.Empty:
-            return None
-    
-    def get_last_depth(self):
-        return self.last_depth_map.copy() if self.last_depth_map is not None else None
-    
-    def stop(self):
-        self.running = False
-        if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=2.0)
-        print("🛑 Async ZoeDepth stopped")
-
-
-# ============================================================================
 # CAMERA VEHICLE DETECTOR (Main Class)
 # ============================================================================
 
@@ -963,10 +733,10 @@ class CameraVehicleDetector:
         print(f"🔥 Device: {self.device}")
         self.fps = fps
         
-        # Load YOLO
-        print("📦 Loading YOLO...")
-        self.yolo = YOLO(YOLO_MODEL_PATH_HEAVY)
-        print("✅ YOLO loaded")
+        # Load YOLO (using yolo11n for real-time performance)
+        print("📦 Loading YOLO11n (fast model)...")
+        self.yolo = YOLO(YOLO_MODEL_PATH_FAST)
+        print("✅ YOLO11n loaded (optimized for real-time inference)")
         
         # Load Classifier
         CLASSIFIER_PATH = str(CNN_DIR / "models/classifier/weights/best.pt")
@@ -979,7 +749,7 @@ class CameraVehicleDetector:
             print("📦 Initializing ByteTracker...")
             self.tracker = ByteTracker(track_buffer=300, frame_rate=int(fps))
             self.use_byte_tracker = True
-            print("✅ ByteTracker initialized")
+            print("✅ ByteTracker initialized (motion-aware tracking enabled)")
         else:
             print("⚠️  ByteTracker not available, falling back to IoU tracking")
             self.tracker = None
@@ -992,24 +762,6 @@ class CameraVehicleDetector:
         self.track_classes = defaultdict(lambda: deque(maxlen=5))
         self.IOU_THRESHOLD = 0.45
         self.MIN_CROP_AREA = 64 * 64
-        
-        # Depth system
-        self.depth_model = None
-        self.zoedepth_interval = zoedepth_interval
-        self.last_zoedepth_depth = None
-        self._ml_depth_fresh = False
-        
-        # Correction factors
-        self.track_correction_factors = {}
-        self.class_correction_factors = {}
-        self.correction_ema_alpha = float(np.clip(correction_alpha, 0.02, 0.98))
-        self.learnable_alpha = bool(learnable_alpha)
-        self.alpha_lr = float(np.clip(alpha_lr, 0.001, 0.5))
-        self.alpha_min = 0.05
-        self.alpha_max = 0.95
-        self.correction_clip_min = 0.75
-        self.correction_clip_max = 1.35
-        self.classical_depth_weight = 0.80
         
         # Motion tracking
         self.track_motion_state = {}
@@ -1046,6 +798,56 @@ class CameraVehicleDetector:
         self.last_scenario_validation = None
         
         print("✅ All Advanced ADAS Components initialized")
+    
+    def validate_and_assess_rear_scenario(self, detections, ego_speed_kmh=0.0, frame_shape=None):
+        """Validate and assess rear scenario with safety metrics"""
+        safety_assessments = {}
+        
+        for det in detections:
+            if det.get('distance') is None:
+                continue
+            
+            track_id = det.get('track_id', -1)
+            distance_m = det.get('distance', 0.0)
+            speed_kmh = det.get('speed', 0.0)
+            bbox = det.get('bbox')
+            
+            # Detect lane position
+            lane_info = self.lane_detector.detect_lane(bbox) if bbox else None
+            
+            # Calculate safety metrics
+            ego_speed_ms = ego_speed_kmh / 3.6
+            rear_speed_ms = speed_kmh / 3.6
+            
+            ttc = self.rear_safety_assessment.calculate_ttc(distance_m, ego_speed_ms, rear_speed_ms)
+            mttc = self.rear_safety_assessment.calculate_mttc(distance_m, ego_speed_ms, rear_speed_ms, 0, 0)
+            pet = self.rear_safety_assessment.calculate_pet(distance_m, ego_speed_ms, rear_speed_ms)
+            drac = self.rear_safety_assessment.calculate_drac(distance_m, ego_speed_ms, rear_speed_ms)
+            
+            # Assess risk level
+            assessment = self.rear_safety_assessment.assess_risk_level(
+                ttc, mttc, pet, drac, distance_m, ego_speed_ms, rear_speed_ms, lane_info
+            )
+            
+            # Get rider action
+            relative_speed_kmh = speed_kmh - ego_speed_kmh
+            rider_action = self.rider_action_recommender.get_rider_action(
+                assessment['level'], lane_info or {}, distance_m, speed_kmh,
+                relative_speed_kmh, det.get('motion', 'unknown'), ego_speed_kmh
+            )
+            
+            assessment['rider_action'] = rider_action
+            assessment['lane_info'] = lane_info
+            assessment['same_lane'] = lane_info.get('lane') == 'CENTER' if lane_info else True
+            
+            safety_assessments[track_id] = assessment
+        
+        # Validate overall scenario
+        ego_speed_ms = ego_speed_kmh / 3.6
+        scenario_validation = self.rear_side_validator.validate_rear_scenario(detections, ego_speed_ms)
+        self.last_scenario_validation = scenario_validation
+        
+        return safety_assessments, scenario_validation
     
     def estimate_distance(self, bbox_height, class_name):
         """Estimate distance using object size"""
@@ -1153,7 +955,7 @@ class CameraVehicleDetector:
                                     final_conf = top1_conf
                                     source = 'YOLO_CLS'
                         except Exception as e:
-                            print(f"Classifier error: {e}")
+                            pass
                 
                 current_boxes_raw.append([x1, y1, x2, y2])
                 results.append({
@@ -1347,86 +1149,358 @@ class CameraVehicleDetector:
         return inter_area / union_area if union_area > 0 else 0
     
     def draw_detections(self, frame, detections, fps=None):
-        """Draw bounding boxes with detection information"""
+        """Draw bounding boxes with rich ADAS information"""
         annotated = frame.copy()
+        
+        # Draw top HUD bar for scenario summary and FPS
+        hud_height = 90
+        cv2.rectangle(annotated, (0, 0), (annotated.shape[1], hud_height), (0, 0, 0), -1)
+        cv2.putText(annotated, "LIVE VEHICLE DETECTION", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        # Scenario and threat information
+        if hasattr(self, 'last_scenario_validation') and self.last_scenario_validation:
+            scenario = self.last_scenario_validation
+            scenario_text = (
+                f"Scenario: {scenario.get('scenario_type', 'unknown')} | "
+                f"Threat: {scenario.get('threat_level', 'none')} | "
+                f"Critical: {scenario.get('critical_vehicles_count', 0)}"
+            )
+            cv2.putText(annotated, scenario_text, (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 255, 200), 2)
+        
+        # Additional FPS text overlay if available
+        if fps:
+            fps_text = f"FPS: {fps:.1f}"
+            cv2.putText(annotated, fps_text, (annotated.shape[1] - 250, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Define alert colors based on safety level
+        safety_colors = {
+            'CRITICAL': (0, 0, 255),      # Red
+            'WARNING': (0, 165, 255),     # Orange
+            'CAUTION': (0, 255, 255),     # Yellow
+            'SAFE': (0, 255, 0),          # Green
+            'INFO': (0, 165, 255),        # Orange
+            'unknown': (128, 128, 128)    # Gray
+        }
         
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
             class_name = det['class']
             confidence = det['confidence']
             distance = det.get('distance', None)
+            distance_metadata = det.get('distance_metadata', {})
+            z_classical = distance_metadata.get('classical_fused', None)
+            z_ml = distance_metadata.get('ml', None)
             motion = det.get('motion', 'unknown')
+            speed = det.get('speed', 0.0)
             
-            color = CLASS_COLORS.get(class_name, (255, 255, 255))
+            # Get safety assessment
+            safety_assess = det.get('safety_assessment', {})
+            safety_level = safety_assess.get('level', 'unknown')
+            alert_type = safety_assess.get('alert_type', 'none')
             
-            motion_colors = {
-                'approaching': (0, 0, 255),
-                'receding': (0, 255, 255),
-                'stable': (0, 255, 0),
-                'unknown': color
-            }
-            box_color = motion_colors.get(motion, color)
+            # Choose color based on safety level
+            if safety_level != 'unknown':
+                box_color = safety_colors.get(safety_level, (128, 128, 128))
+            else:
+                motion_colors = {
+                    'approaching': (0, 0, 255),    # Red
+                    'receding': (0, 255, 255),     # Yellow
+                    'stable': (0, 255, 0),         # Green
+                    'unknown': CLASS_COLORS.get(class_name, (255, 255, 255))
+                }
+                box_color = motion_colors.get(motion, CLASS_COLORS.get(class_name, (255, 255, 255)))
             
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
+            # Draw box
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 3)
             
-            label = f"{class_name}: {confidence:.2f}"
+            # Draw label with distance and depth estimates
             if distance:
-                label += f" | D:{distance:.1f}m"
+                label = f"{class_name}: {confidence:.2f} | D:{distance:.1f}m"
+                if isinstance(z_classical, (int, float, np.floating)):
+                    label += f" C:{float(z_classical):.1f}"
+                if isinstance(z_ml, (int, float, np.floating)):
+                    label += f" ML:{float(z_ml):.1f}"
+            else:
+                label = f"{class_name}: {confidence:.2f}"
             
             label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10), 
                          (x1 + label_size[0], y1), box_color, -1)
             cv2.putText(annotated, label, (x1, y1 - 5), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        
-        if fps:
-            fps_text = f"FPS: {fps:.1f}"
-            cv2.putText(annotated, fps_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
+            
+            # Draw distance below box
+            if distance:
+                dist_text = f"{distance:.1f}m"
+                dist_size, _ = cv2.getTextSize(dist_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                cv2.rectangle(annotated, (x1, y2), 
+                             (x1 + dist_size[0] + 10, y2 + dist_size[1] + 10), box_color, -1)
+                cv2.putText(annotated, dist_text, (x1 + 5, y2 + dist_size[1] + 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            # Draw motion state
+            if motion != 'unknown':
+                if speed > 0:
+                    motion_text = f"{motion.upper()} {speed:.1f}km/h"
+                else:
+                    motion_text = motion.upper()
+                motion_size, _ = cv2.getTextSize(motion_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                motion_x = x2 - motion_size[0] - 10
+                motion_y = y1 + 25
+                cv2.rectangle(annotated, (motion_x - 5, motion_y - motion_size[1] - 5), 
+                             (x2 - 5, motion_y + 5), box_color, -1)
+                cv2.putText(annotated, motion_text, (motion_x, motion_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Draw safety assessment and rider action
+            if safety_level != 'unknown' and alert_type != 'none':
+                safety_y = y2 + 40
+                
+                lane_info = safety_assess.get('lane_info', {})
+                lane_name = lane_info.get('lane', 'CENTER') if lane_info else 'CENTER'
+                is_same_lane = safety_assess.get('same_lane', True)
+                
+                if not is_same_lane:
+                    safety_text = f"[{lane_name} LANE] {distance:.1f}m away"
+                    box_color_text = (0, 165, 255)
+                else:
+                    safety_text = f"[{safety_level}] {alert_type}"
+                    
+                    ttc_val = safety_assess.get('ttc')
+                    drac_val = safety_assess.get('drac')
+                    
+                    if ttc_val is not None:
+                        safety_text += f" TTC:{ttc_val:.2f}s"
+                    if drac_val is not None and drac_val != float('inf'):
+                        safety_text += f" DRAC:{drac_val:.2f}m/s²"
+                    
+                    box_color_text = box_color
+                
+                safety_size, _ = cv2.getTextSize(safety_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(annotated, (x1, safety_y - safety_size[1] - 5), 
+                             (x1 + safety_size[0] + 10, safety_y + 5), box_color_text, -1)
+                cv2.putText(annotated, safety_text, (x1 + 5, safety_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Draw rider action recommendation
+                rider_action = safety_assess.get('rider_action', {})
+                if rider_action and rider_action.get('action'):
+                    instruction = rider_action.get('rider_instruction', '')
+                    urgency = rider_action.get('urgency', 'LOW')
+                    
+                    urgency_colors = {
+                        'CRITICAL': (0, 0, 255),      # Red
+                        'HIGH': (0, 165, 255),        # Orange
+                        'MEDIUM': (0, 255, 255),      # Yellow
+                        'LOW': (0, 255, 0),           # Green
+                    }
+                    urgency_color = urgency_colors.get(urgency, (128, 128, 128))
+                    
+                    action_y = safety_y + 25
+                    action_text = f"→ {instruction[:50]}"
+                    action_size, _ = cv2.getTextSize(action_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(annotated, (x1, action_y - action_size[1] - 5), 
+                                 (x1 + action_size[0] + 10, action_y + 5), urgency_color, -1)
+                    cv2.putText(annotated, action_text, (x1 + 5, action_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
         return annotated
 
 
+def setup_realsense_camera(width=640, height=480, fps=30):
+    """Setup RealSense D455 camera"""
+    try:
+        import pyrealsense2 as rs
+
+        # Check if any RealSense devices are connected
+        ctx = rs.context()
+        devices = ctx.query_devices()
+        if len(devices) == 0:
+            print("⚠️ No RealSense cameras detected")
+            return None, None
+
+        print(f"📷 Found {len(devices)} RealSense device(s)")
+        for i, device in enumerate(devices):
+            try:
+                name = device.get_info(rs.camera_info.name)
+                serial = device.get_info(rs.camera_info.serial_number)
+                print(f"   {i+1}. {name} (Serial: {serial})")
+            except:
+                print(f"   {i+1}. Unknown RealSense device")
+
+        pipeline = rs.pipeline()
+        config = rs.config()
+
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+
+        print("🔄 Starting RealSense pipeline...")
+        pipeline.start(config)
+        print("✅ RealSense pipeline started successfully")
+
+        return pipeline, (width, height)
+    except Exception as e:
+        print(f"⚠️ RealSense setup failed: {e}")
+        print("💡 Common solutions:")
+        print("   - Ensure camera is properly powered (use USB 3.0 port or external power)")
+        print("   - Check USB cable connection")
+        print("   - Remove any lens covers or obstructions")
+        print("   - Try a different USB port")
+        print("   - Update RealSense firmware if needed")
+        return None, None
+
+
+def get_realsense_frame(pipeline):
+    """Get frame from RealSense camera"""
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=5000)
+        color_frame = frames.get_color_frame()
+
+        if not color_frame:
+            print("⚠️ No color frame received from RealSense")
+            return None
+
+        return np.asanyarray(color_frame.get_data())
+    except Exception as e:
+        print(f"⚠️ Error getting RealSense frame: {e}")
+        if "didn't arrive within" in str(e):
+            print("💡 Camera timeout - check power, USB connection, and remove any lens covers")
+        return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Camera-based Vehicle Detection with Advanced ADAS')
+    parser = argparse.ArgumentParser(description='Real-time Camera ADAS Detection')
     parser.add_argument('--camera', type=str, default='0',
-                       help='Camera device ID or video file path (default: 0)')
-    parser.add_argument('--width', type=int, default=640,
-                       help='Camera width (default: 640)')
-    parser.add_argument('--height', type=int, default=480,
-                       help='Camera height (default: 480)')
-    parser.add_argument('--device', type=str, default='cuda', 
-                       choices=['cuda', 'cpu'],
-                       help='Device to use (default: cuda)')
-    parser.add_argument('--save', type=str, help='Save output video')
-    parser.add_argument('--zoedepth-interval', type=int, default=30,
-                       help='Run depth update every N frames (default: 30)')
+                       help='Camera index or video file path')
+    parser.add_argument('--width', type=int, default=1280,
+                       help='Frame width')
+    parser.add_argument('--height', type=int, default=720,
+                       help='Frame height')
+    parser.add_argument('--device', type=str, default='cuda',
+                       choices=['cuda', 'cpu'])
+    parser.add_argument('--save', type=str, default=None,
+                       help='Save output video')
+    parser.add_argument('--no-display', action='store_true',
+                       help='Disable display window')
+    parser.add_argument('--realsense', action='store_true',
+                       help='Use RealSense D455 camera')
+    parser.add_argument('--force-usb', action='store_true',
+                       help='Force USB camera even if RealSense is available')
+    parser.add_argument('--profile', type=str, default='a6000_full',
+                       choices=['a6000_full', 'jetson_nano_restricted', 'jetson_nano_power_save'],
+                       help='GPU profile')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Verbose output')
+    parser.add_argument('--rear-camera', action='store_true',
+                       help='Rear camera mode')
+    parser.add_argument('--hybrid-depth', action='store_true',
+                       help='Enable hybrid depth estimation')
     
     args = parser.parse_args()
     
+    # Apply GPU configuration if available
+    if _GPU_CONFIG_AVAILABLE:
+        print(f"🎮 Applying GPU profile: {args.profile}")
+        try:
+            gpu_manager = setup_gpu(profile=args.profile, verbose=args.verbose)
+            # Setup inference optimization
+            opt_settings = ModelOptimizer(profile=args.profile).get_optimization_settings()
+            InferenceOptimizer.enable_cudnn_benchmark(opt_settings.get('use_cudnn_autotuner', True))
+            InferenceOptimizer.use_tf32(opt_settings.get('enable_tf32', False))
+            print("✓ GPU configuration applied\n")
+        except Exception as e:
+            print(f"⚠️  Failed to apply GPU configuration: {e}")
+            print("   Running with default settings\n")
+    else:
+        print(f"🎮 GPU profile requested: {args.profile} (configuration not available)")
+    
     print("\n" + "="*60)
-    print("🚗 REAL-TIME CAMERA VEHICLE DETECTION (Advanced ADAS)")
+    print("🎬 REAL-TIME CAMERA VEHICLE DETECTION (Advanced ADAS)")
     print("="*60 + "\n")
     
     # Try to open camera
-    try:
-        camera_id = int(args.camera)
-        cap = cv2.VideoCapture(camera_id)
-    except ValueError:
-        # It's a file path
-        cap = cv2.VideoCapture(args.camera)
+    cap = None
+    realsense_pipeline = None
+    use_realsense = False
     
-    if not cap.isOpened():
-        print(f"❌ Failed to open camera/video: {args.camera}")
-        return
+    if args.realsense and not args.force_usb:
+        print("🎥 Attempting to open RealSense D455 camera...")
+        realsense_pipeline, _ = setup_realsense_camera(args.width, args.height, fps=30)
+        if realsense_pipeline:
+            use_realsense = True
+            print("✓ RealSense camera ready\n")
+        else:
+            print("❌ RealSense camera setup failed")
+            print("💡 RealSense troubleshooting:")
+            print("   • Ensure camera is powered (use USB 3.0 port or powered hub)")
+            print("   • Remove any lens covers or obstructions")
+            print("   • Try: rs-enumerate-devices (if installed)")
+            print("   • Update RealSense firmware if needed")
+            print("   • Falling back to USB camera...\n")
     
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    # If not using RealSense, try USB camera
+    if not use_realsense:
+        # Try the specified camera first
+        try:
+            camera_id = int(args.camera)
+            cap = cv2.VideoCapture(camera_id)
+            if cap.isOpened():
+                print(f"✅ Camera {camera_id} opened successfully")
+            else:
+                print(f"⚠️ Camera {camera_id} not available, trying other cameras...")
+                cap = None
+        except ValueError:
+            # If it's not a number, treat it as a video file path
+            cap = cv2.VideoCapture(args.camera)
+            if cap.isOpened():
+                print(f"✅ Video file opened: {args.camera}")
+            else:
+                print(f"⚠️ Video file not found: {args.camera}")
+                cap = None
+        
+        # If the specified camera failed, try to find an available camera
+        if not cap or not cap.isOpened():
+            print("🔍 Searching for available cameras...")
+            available_cameras = []
+            
+            # Try common camera indices
+            for i in range(10):  # Check cameras 0-9
+                test_cap = cv2.VideoCapture(i)
+                if test_cap.isOpened():
+                    width = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    available_cameras.append((i, width, height))
+                    test_cap.release()
+            
+            if available_cameras:
+                # Use the first available camera
+                camera_id, width, height = available_cameras[0]
+                cap = cv2.VideoCapture(camera_id)
+                print(f"✅ Found and opened camera {camera_id} ({width}x{height})")
+            else:
+                print("❌ No cameras found on the system")
+                print("💡 Troubleshooting tips:")
+                print("   • Connect a USB webcam")
+                print("   • Check USB cable connections")
+                print("   • Try running: v4l2-ctl --list-devices")
+                print("   • For RealSense: use --realsense flag")
+                return
     
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Set frame dimensions
+    if not use_realsense:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    else:
+        actual_width = args.width
+        actual_height = args.height
     
-    print(f"✅ Camera opened: {actual_width}x{actual_height}")
+    print(f"✅ Source opened: {actual_width}x{actual_height}")
     
     # Initialize detector
     detector = CameraVehicleDetector(device=args.device)
@@ -1439,22 +1513,67 @@ def main():
         print(f"💾 Saving to: {args.save}")
     
     print("\n🚀 Starting detection...")
-    print("   Press 'q' to quit\n")
+    if not args.no_display:
+        print("   Press 'q' or ESC to quit\n")
     
     frame_count = 0
     start_time = time.time()
+    window_name = "🚗 ADAS Detection (q=quit)"
+    consecutive_failures = 0
+    max_consecutive_failures = 5
+    
+    # Create display window
+    if not args.no_display:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 1280, 720)
+        except Exception as e:
+            print(f"⚠️  Could not create display window: {e}")
+            args.no_display = True
     
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("\n🎬 End of stream reached")
-                break
+            # Get frame
+            if use_realsense:
+                frame = get_realsense_frame(realsense_pipeline)
+                if frame is None:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        print(f"\n❌ RealSense camera failed after {consecutive_failures} attempts")
+                        print("💡 Troubleshooting tips:")
+                        print("   • Check USB cable and power supply")
+                        print("   • Ensure camera lens is not covered")
+                        print("   • Try different USB port (preferably USB 3.0)")
+                        print("   • Restart the camera by unplugging and replugging")
+                        print("   • Check camera firmware: https://dev.intelrealsense.com/docs/firmware-update-tool")
+                        break
+                    print(f"⚠️ RealSense frame failed ({consecutive_failures}/{max_consecutive_failures}), retrying...")
+                    time.sleep(0.5)  # Brief pause before retry
+                    continue
+                else:
+                    consecutive_failures = 0  # Reset on success
+                ret = True
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    print("\n🎬 End of stream reached")
+                    break
             
             frame_count += 1
             
             # Detect
             detections = detector.detect_frame(frame)
+            
+            # Safety assessment
+            safety_assessments, scenario_validation = detector.validate_and_assess_rear_scenario(
+                detections, ego_speed_kmh=0.0, frame_shape=frame.shape
+            )
+            
+            # Add safety assessment to detections
+            for det in detections:
+                track_id = det.get('track_id', -1)
+                if track_id in safety_assessments:
+                    det['safety_assessment'] = safety_assessments[track_id]
             
             # Calculate FPS
             elapsed = time.time() - start_time
@@ -1464,7 +1583,11 @@ def main():
             annotated = detector.draw_detections(frame, detections, fps=fps)
             
             # Display
-            cv2.imshow('Vehicle Detection - Press q to quit', annotated)
+            if not args.no_display:
+                try:
+                    cv2.imshow(window_name, annotated)
+                except Exception as e:
+                    print(f"⚠️  Display error: {e}")
             
             # Save
             if writer:
@@ -1475,16 +1598,26 @@ def main():
                 print(f"Frame {frame_count} | FPS: {fps:.1f} | Detections: {len(detections)}")
             
             # Handle key press
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if not args.no_display:
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('q') or key == 27:
+                    print("\n✓ Exit requested")
+                    break
     
     finally:
-        cap.release()
+        # Cleanup
+        if use_realsense and realsense_pipeline:
+            realsense_pipeline.stop()
+            print("✓ RealSense pipeline stopped")
+        elif cap:
+            cap.release()
+        
         if writer:
             writer.release()
-        cv2.destroyAllWindows()
+        if not args.no_display:
+            cv2.destroyAllWindows()
         
-        # Print stats
+        # Stats
         elapsed = time.time() - start_time
         avg_fps = frame_count / elapsed if elapsed > 0 else 0
         
@@ -1494,8 +1627,11 @@ def main():
         print(f"Frames processed: {frame_count}")
         print(f"Time elapsed: {elapsed:.2f}s")
         print(f"Average FPS: {avg_fps:.2f}")
+        if args.save:
+            print(f"Output saved to: {args.save}")
         print("="*60 + "\n")
 
 
 if __name__ == "__main__":
     main()
+
