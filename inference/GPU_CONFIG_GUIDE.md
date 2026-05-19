@@ -40,37 +40,37 @@ This system allows you to restrict your NVIDIA RTX A6000 GPU to match Jetson Nan
 
 ### A6000 Full (Unrestricted)
 ```
-AI Performance:    1458 TFLOPS (FP32)
-CUDA Cores:        7680
-Memory:            48GB
-Memory Bandwidth:  576 GB/s
-Power:             50-300W
-Max Batch Size:    128
+AI Performance: 1458 TFLOPS (FP32)
+CUDA Cores: 7680
+Memory: 48GB
+Memory Bandwidth: 576 GB/s
+Power: 50-300W
+Max Batch Size: 128
 Recommended Precision: FP32
 ```
 
 ### Jetson Nano Restricted (Simulated)
 ```
-AI Performance:    67 TOPS
-CUDA Cores:        1024 (simulated)
-Memory:            8GB (limited)
-Memory Bandwidth:  102 GB/s (simulated)
-Power:             7-25W
-Max Batch Size:    4
+AI Performance: 67 TOPS
+CUDA Cores: 1024 (simulated)
+Memory: 8GB (limited)
+Memory Bandwidth: 102 GB/s (simulated)
+Power: 7-25W
+Max Batch Size: 4
 Recommended Precision: FP16
-Quantization:      INT8
+Quantization: INT8
 ```
 
 ### Jetson Nano Power Save (7W Mode)
 ```
-AI Performance:    35 TOPS (50% reduced)
-CUDA Cores:        512 (simulated reduced)
-Memory:            8GB
-Memory Bandwidth:  51 GB/s (simulated)
-Power:             7W (fixed)
-Max Batch Size:    1
+AI Performance: 35 TOPS (50% reduced)
+CUDA Cores: 512 (simulated reduced)
+Memory: 8GB
+Memory Bandwidth: 51 GB/s (simulated)
+Power: 7W (fixed)
+Max Batch Size: 1
 Recommended Precision: FP16
-Quantization:      INT8
+Quantization: INT8
 ```
 
 ## Installation
@@ -101,15 +101,15 @@ python inference_with_gpu_config.py list-profiles
 
 Output:
 ```
-📊 Available GPU Profiles:
+ Available GPU Profiles:
 
-  • a6000_full
+  - a6000_full
     NVIDIA RTX A6000
 
-  • jetson_nano_restricted
+  - jetson_nano_restricted
     NVIDIA Jetson Nano Super (Simulated)
 
-  • jetson_nano_power_save
+  - jetson_nano_power_save
     NVIDIA Jetson Nano Super (7W Power Save)
 ```
 
@@ -156,10 +156,10 @@ memory_info = gpu_manager.get_memory_info()
 print(f"Memory: {memory_info['allocated_gb']:.2f}GB / {memory_info['total_gb']:.2f}GB")
 
 # Get recommended batch size
-batch_size = gpu_manager.get_recommended_batch_size()  # Returns 4
+batch_size = gpu_manager.get_recommended_batch_size() # Returns 4
 
 # Get recommended model size
-model_size = gpu_manager.get_recommended_model_size()  # Returns 'medium'
+model_size = gpu_manager.get_recommended_model_size() # Returns 'medium'
 ```
 
 ### Using Context Manager
@@ -183,9 +183,9 @@ from model_optimizer import ModelOptimizer, InferenceOptimizer
 optimizer = ModelOptimizer('jetson_nano_restricted')
 
 # Get optimization settings
-batch_size = optimizer.get_batch_size()  # 4
-num_workers = optimizer.get_num_workers()  # 2
-precision = optimizer.get_inference_settings()['model_precision']  # 'float16'
+batch_size = optimizer.get_batch_size() # 4
+num_workers = optimizer.get_num_workers() # 2
+precision = optimizer.get_inference_settings()['model_precision'] # 'float16'
 
 # Optimize model
 model = optimizer.optimize_model(model)
@@ -194,7 +194,7 @@ model = optimizer.optimize_model(model)
 dataloader = optimizer.create_optimized_dataloader(dataset)
 
 # Setup inference optimization
-InferenceOptimizer.use_tf32(False)  # Disable for Jetson mode
+InferenceOptimizer.use_tf32(False) # Disable for Jetson mode
 InferenceOptimizer.enable_cudnn_benchmark(False)
 ```
 
@@ -298,7 +298,7 @@ while True:
 
 **Solution 1**: Reduce batch size in gpu_profiles.json
 ```json
-"batch_size": 2  // Reduce from 4
+"batch_size": 2 // Reduce from 4
 ```
 
 **Solution 2**: Use power save mode
@@ -321,7 +321,7 @@ model_choice = optimizer.get_model_choice()
 ```python
 gpu_manager = setup_gpu('jetson_nano_power_save', verbose=True)
 power_info = gpu_manager.monitor_power_consumption()
-print(power_info)  # Should show ~7W
+print(power_info) # Should show ~7W
 ```
 
 ### Issue: Models Load Slowly
@@ -339,9 +339,9 @@ model = torch.jit.trace(model, example_input)
 **Solution**: Pre-tune cuDNN with a warmup:
 ```python
 from model_optimizer import InferenceOptimizer
-InferenceOptimizer.enable_cudnn_benchmark(True)  # Temporary for warmup
+InferenceOptimizer.enable_cudnn_benchmark(True) # Temporary for warmup
 # Run 10-20 iterations
-InferenceOptimizer.enable_cudnn_benchmark(False)  # Restore for consistency
+InferenceOptimizer.enable_cudnn_benchmark(False) # Restore for consistency
 ```
 
 ## Advanced Configuration

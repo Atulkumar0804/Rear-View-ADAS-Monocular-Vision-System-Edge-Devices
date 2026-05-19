@@ -1,11 +1,11 @@
 # Raspberry Pi 5 ADAS TCP Streaming Setup
 
-## Problem Solved ✅
+## Problem Solved
 
-- ✅ Picamera2 works when using **system Python** (not venv)
-- ✅ Created camera capture wrapper that uses system Python subprocess
-- ✅ TCP server now works with the wrapper for frame streaming
-- ✅ Ready to view camera stream in web browser
+- Picamera2 works when using **system Python** (not venv)
+- Created camera capture wrapper that uses system Python subprocess
+- TCP server now works with the wrapper for frame streaming
+- Ready to view camera stream in web browser
 
 ## Quick Start (3 Steps)
 
@@ -20,7 +20,7 @@ python3 adas_tcp_stream_wrapper.py \
   --no-adas
 ```
 
-Wait for output showing "✅ Listening on 0.0.0.0:5001"
+Wait for output showing " Listening on 0.0.0.0:5001"
 
 ### Step 2: Start the Web Viewer on Your Laptop
 (In another terminal)
@@ -34,7 +34,7 @@ cd /home/spidey/Atul/Rear-View-ADAS/CNN/inference
 
 Replace `<PI_IP>` with Raspberry Pi's IP address (e.g., `10.72.241.199`)
 
-Wait for output showing "✅ Web viewer on http://0.0.0.0:8000"
+Wait for output showing " Web viewer on http://0.0.0.0:8000"
 
 ### Step 3: Open Browser and View
 Navigate to: `http://localhost:8000`
@@ -47,31 +47,31 @@ You should see the **live camera feed**!
 
 ```
 Raspberry Pi:
-┌─────────────────────────────────────────┐
-│ System Python (has Picamera2)           │
-│  └─ camera_capture_wrapper.py           │
-│     Reads from /dev/media3 (libcamera)  │
-│     Outputs JPEG frames to stdout       │
-│                                         │
-│ venv Python                             │
-│  └─ adas_tcp_stream_wrapper.py          │
-│     Reads subprocess output             │
-│     Sends over TCP socket :5001         │
-│     (Optional: runs ADAS detection)     │
-└──────────────┬──────────────────────────┘
-               │ TCP port 5001
-               │  
-Your Laptop:  │
-┌─────────────┴──────────────────────────┐
-│ venv Python                             │
-│  └─ tcp_stream_viewer.py               │
-│     Connects to TCP :5001               │
-│     Flask server on :8000               │
-│                                         │
-│ Browser                                 │
-│  └─ http://localhost:8000              │
-│     Displays MJPEG stream               │
-└─────────────────────────────────────────┘
+
+ System Python (has Picamera2)
+   camera_capture_wrapper.py
+     Reads from /dev/media3 (libcamera)
+     Outputs JPEG frames to stdout
+
+ venv Python
+   adas_tcp_stream_wrapper.py
+     Reads subprocess output
+     Sends over TCP socket :5001
+     (Optional: runs ADAS detection)
+
+                TCP port 5001
+
+Your Laptop:
+
+ venv Python
+   tcp_stream_viewer.py
+     Connects to TCP :5001
+     Flask server on :8000
+
+ Browser
+   http://localhost:8000
+     Displays MJPEG stream
+
 ```
 
 ---
@@ -192,7 +192,7 @@ Picamera2 requires:
 - System Python packages → can't install in venv due to conflicts
 
 Solution:
-- Run capture in **system Python subprocess** 
+- Run capture in **system Python subprocess**
 - Communicate via **length-prefixed JPEG protocol** through stdout/stdin pipe
 - Keeps venv clean, avoids version conflicts
 

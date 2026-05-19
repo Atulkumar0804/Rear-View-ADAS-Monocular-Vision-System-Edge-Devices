@@ -2,22 +2,22 @@
 
 This directory contains optimized TCP streaming and Flask web server for real-time vehicle detection with advanced ADAS features.
 
-## 🚀 Features
+## Features
 
-✅ **TCP Streaming Server** - Low-latency real-time camera streaming (20-37 FPS)
-✅ **YOLO Caching Optimization** - 7-12x performance improvement over baseline
-✅ **Real-time Vehicle Detection** - YOLO11n with ByteTracker
-✅ **Advanced ADAS Features** - Safety assessment, lane detection, TTC/DRAC metrics
-✅ **Web Dashboard** - Real-time FPS, safety levels, detection metrics
-✅ **Mobile Responsive** - Works on phones, tablets, desktops
-✅ **Raspberry Pi Support** - Optimized for RPi 5 with Picamera2
-✅ **Safety Metrics** - TTC, MTTC, PET, DRAC, lane-aware collision warning
+ **TCP Streaming Server** - Low-latency real-time camera streaming (20-37 FPS)
+ **YOLO Caching Optimization** - 7-12x performance improvement over baseline
+ **Real-time Vehicle Detection** - YOLO11n with ByteTracker
+ **Advanced ADAS Features** - Safety assessment, lane detection, TTC/DRAC metrics
+ **Web Dashboard** - Real-time FPS, safety levels, detection metrics
+ **Mobile Responsive** - Works on phones, tablets, desktops
+ **Raspberry Pi Support** - Optimized for RPi 5 with Picamera2
+ **Safety Metrics** - TTC, MTTC, PET, DRAC, lane-aware collision warning
 
 ## Performance Metrics
 
 | Metric | Before Optimization | After Optimization | Improvement |
 |--------|--------------------|--------------------|-------------|
-| FPS | 2.9 FPS | **20-37 FPS** | **7-12x** 🚀 |
+| FPS | 2.9 FPS | **20-37 FPS** | **7-12x** |
 | Detection Time | 300-500ms | **0.7-2ms** | **200-700x** |
 | Total Frame Time | 330-500ms | **2-5ms** | **100-200x** |
 
@@ -39,7 +39,7 @@ pip install -r web_requirements.txt
 
 2. Download YOLO11n model (automatic on first run)
 
-## 🎯 Quick Start
+## Quick Start
 
 ### Option 1: TCP Streaming Server (Recommended for Raspberry Pi)
 
@@ -104,16 +104,16 @@ Access from laptop: `http://<pi-ip>:5000`
 ### TCP Server Arguments
 
 ```
---bind              Server bind address (default: 0.0.0.0)
---port              Server port (default: 5001)
---width             Stream frame width (default: 640)
---height            Stream frame height (default: 480)
---fps               Capture FPS (default: 30)
---jpeg-quality      JPEG compression (1-100, default: 80)
---detect-width      Detection resolution width (lower = faster)
---detect-height     Detection resolution height
---raw-stream        Skip detection for maximum speed
---max-failures      Max consecutive failures before restart (default: 30)
+--bind Server bind address (default: 0.0.0.0)
+--port Server port (default: 5001)
+--width Stream frame width (default: 640)
+--height Stream frame height (default: 480)
+--fps Capture FPS (default: 30)
+--jpeg-quality JPEG compression (1-100, default: 80)
+--detect-width Detection resolution width (lower = faster)
+--detect-height Detection resolution height
+--raw-stream Skip detection for maximum speed
+--max-failures Max consecutive failures before restart (default: 30)
 ```
 
 ### Connect Client to TCP Server
@@ -153,7 +153,7 @@ cv2.destroyAllWindows()
 "
 ```
 
-## 🔍 How YOLO Caching Works
+## How YOLO Caching Works
 
 ### The Optimization
 
@@ -165,7 +165,7 @@ Frame 1: YOLO (300-500ms) → Detect
 Frame 2: YOLO (300-500ms) → Detect
 Frame 3: YOLO (300-500ms) → Detect
 ...
-Result: 2-3 FPS max ❌
+Result: 2-3 FPS max
 ```
 
 **After (YOLO Caching):**
@@ -177,7 +177,7 @@ Frame 3: Reuse cached (0.7-2ms)
 Frame 10: YOLO (300-500ms) → Update cache
 Frame 11: Reuse cached (0.7-2ms)
 ...
-Result: 20-37 FPS ✅
+Result: 20-37 FPS
 ```
 
 ### Key Features
@@ -192,8 +192,8 @@ Result: 20-37 FPS ✅
 
 ```python
 # In camera_inference.py
-detector.skip_yolo_frames = 10      # YOLO every 10 frames
-detector.skip_horizon_frames = 5    # Horizon every 5 frames
+detector.skip_yolo_frames = 10 # YOLO every 10 frames
+detector.skip_horizon_frames = 5 # Horizon every 5 frames
 detector.skip_safety_calc_frames = 2 # Safety metrics every 2 frames
 ```
 
@@ -224,7 +224,7 @@ detector.skip_safety_calc_frames = 2 # Safety metrics every 2 frames
 - `GET /api/health` - Health check
 - `GET /api/config` - Configuration
 
-## 📊 Dashboard Features
+## Dashboard Features
 
 ### Camera Feed
 - **Live MJPEG Stream** - Real-time video with overlays
@@ -344,17 +344,17 @@ ss -tuln | grep 5001
 
 ```
 inference/
-├── camera_inference.py              # Main ADAS detection engine
-├── adas_tcp_stream_wrapper.py       # TCP server with streaming
-├── camera_capture_wrapper.py        # Picamera2 capture wrapper
-├── tcp_stream_viewer.py             # Web viewer for TCP stream
-├── web_server.py                    # Flask web server
-├── byte_tracker.py                  # Motion-aware tracking
-├── models/
-│   ├── yolo11n.pt                   # YOLO detection model
-│   └── depth_anything_v2/           # Depth estimation
-└── templates/
-    └── index.html                   # Web dashboard HTML
+ camera_inference.py # Main ADAS detection engine
+ adas_tcp_stream_wrapper.py # TCP server with streaming
+ camera_capture_wrapper.py # Picamera2 capture wrapper
+ tcp_stream_viewer.py # Web viewer for TCP stream
+ web_server.py # Flask web server
+ byte_tracker.py # Motion-aware tracking
+ models/
+    yolo11n.pt # YOLO detection model
+    depth_anything_v2/ # Depth estimation
+ templates/
+     index.html # Web dashboard HTML
 ```
 
 ## Safety Assessment Metrics
@@ -376,12 +376,12 @@ inference/
 ## Recent Updates
 
 ### Version 2.0 - YOLO Caching Optimization (Current)
-- ✅ Added YOLO inference caching (run every 10 frames)
-- ✅ Improved FPS from 2.9 to 20-37 FPS
-- ✅ Reduced detection time from 300-500ms to 0.7-2ms
-- ✅ Simplified TCP wrapper logic
-- ✅ Better frame handling with cached results
-- ✅ ByteTracker smooths tracking between YOLO updates
+- Added YOLO inference caching (run every 10 frames)
+- Improved FPS from 2.9 to 20-37 FPS
+- Reduced detection time from 300-500ms to 0.7-2ms
+- Simplified TCP wrapper logic
+- Better frame handling with cached results
+- ByteTracker smooths tracking between YOLO updates
 
 ### Version 1.0 - Initial Implementation
 - Basic TCP streaming
@@ -414,11 +414,11 @@ For issues or questions:
 
 ## Mobile Optimization
 
-✅ **Responsive Design** - Works on phones, tablets, desktop
-✅ **Touch-Friendly** - Large buttons for mobile
-✅ **Low Bandwidth** - MJPEG with 80% JPEG quality
-✅ **Auto-Refresh** - Updates every 500ms
-✅ **Error Handling** - User-friendly error messages
+ **Responsive Design** - Works on phones, tablets, desktop
+ **Touch-Friendly** - Large buttons for mobile
+ **Low Bandwidth** - MJPEG with 80% JPEG quality
+ **Auto-Refresh** - Updates every 500ms
+ **Error Handling** - User-friendly error messages
 
 ## Performance Tips
 
@@ -449,7 +449,7 @@ Solution: Check camera_index with: python -c "import cv2; cap = cv2.VideoCapture
 ### Mobile Can't Connect
 ```
 Error: Connection refused
-Solution: 
+Solution:
 1. Check firewall is open for port 5000
 2. Verify PC and mobile are on same network
 3. Use actual IP address, not localhost
@@ -503,17 +503,17 @@ cv2.IMWRITE_JPEG_QUALITY, 80
 
 ```
 inference/
-├── web_server.py           # Main Flask server
-├── web_requirements.txt    # Dependencies
-├── camera_inference.py     # Inference logic
-├── templates/
-│   └── index.html         # Web dashboard
-└── README_WEB.md          # This file
+ web_server.py # Main Flask server
+ web_requirements.txt # Dependencies
+ camera_inference.py # Inference logic
+ templates/
+    index.html # Web dashboard
+ README_WEB.md # This file
 ```
 
 ## Future Enhancements
 
-🔧 **Planned Features:**
+ **Planned Features:**
 - WebSocket for real-time alerts
 - Video recording with detections
 - Multi-camera support
@@ -523,7 +523,7 @@ inference/
 
 ## Security Notes
 
-⚠️ **For Local Network Only**
+ **For Local Network Only**
 - No authentication by default
 - Run behind firewall for security
 - Consider adding API key protection for public deployment

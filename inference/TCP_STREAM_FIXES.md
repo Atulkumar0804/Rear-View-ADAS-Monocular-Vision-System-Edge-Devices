@@ -2,19 +2,19 @@
 
 ## Issues Found & Fixed
 
-✅ **Issue 1: V4L2 backend failing**
+ **Issue 1: V4L2 backend failing**
 - **Problem**: OpenCV with V4L2 backend couldn't access `/dev/video*` devices
 - **Fix**: Modified to detect Raspberry Pi and force Picamera2 backend automatically
 
-✅ **Issue 2: Picamera2 not in venv**
+ **Issue 2: Picamera2 not in venv**
 - **Problem**: `pip install picamera2` doesn't work in venv (system package only)
 - **Fix**: Added graceful fallback and improved error messages
 
-✅ **Issue 3: Missing diagnostic output**
+ **Issue 3: Missing diagnostic output**
 - **Problem**: Couldn't tell where frame capture was failing
 - **Fix**: Added detailed logging at each step (camera opening, resolution, FPS, frame reading)
 
-✅ **Issue 4: Poor error handling**
+ **Issue 4: Poor error handling**
 - **Problem**: Script would exit silently on camera errors
 - **Fix**: Added verbose error messages and automatic camera reopening
 
@@ -34,7 +34,7 @@ chmod +x troubleshoot_camera.sh
 
 This will show you:
 - Camera availability via libcamera
-- /dev/video* device status  
+- /dev/video* device status
 - Picamera2 installation status
 
 ### Step 3: Run the TCP stream server
@@ -76,13 +76,13 @@ Then open browser: `http://localhost:8000`
 ## Diagnostics
 
 The improved server now prints:
-- ✅ Listening on address:port
-- ✅ Client connected info
-- 📷 Camera opened successfully
-- 📐 Resolution got/set
-- ⏱️  FPS got/set
-- 📊 Frame capture status every 30 frames
-- ⚠️ Detailed error messages if something fails
+- Listening on address:port
+- Client connected info
+- Camera opened successfully
+- Resolution got/set
+- ⏱ FPS got/set
+- Frame capture status every 30 frames
+- Detailed error messages if something fails
 
 ## Known Issues & Solutions
 
@@ -102,8 +102,8 @@ The improved server now prints:
 
 ## Testing Path
 
-1. ✅ Run troubleshoot_camera.sh to verify camera works
-2. ✅ Run adas_tcp_stream.py with --no-adas (pure streaming)
-3. ✅ Run tcp_stream_viewer.py on laptop
-4. ✅ Open browser and verify stream appears
-5. ✅ (Optional) Enable ADAS by removing --no-adas flag
+1. Run troubleshoot_camera.sh to verify camera works
+2. Run adas_tcp_stream.py with --no-adas (pure streaming)
+3. Run tcp_stream_viewer.py on laptop
+4. Open browser and verify stream appears
+5. (Optional) Enable ADAS by removing --no-adas flag
