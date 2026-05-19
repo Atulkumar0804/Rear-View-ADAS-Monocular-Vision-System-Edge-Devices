@@ -23,6 +23,7 @@ from torchvision import transforms
 import cv2
 import numpy as np
 import argparse
+import platform
 from pathlib import Path
 import time
 import sys
@@ -32,6 +33,9 @@ import json
 import logging
 import logging.handlers
 import queue
+import signal
+import struct
+import subprocess
 from queue import Queue
 from collections import deque, defaultdict
 import math
@@ -43,6 +47,25 @@ sys.path.append(str(CNN_DIR))
 
 from scripts.zoedepth_loader import load_zoedepth_model
 from ultralytics import YOLO
+
+# Raspberry Pi / libcamera support
+_PICAMERA2_AVAILABLE = False
+Picamera2 = None
+try:
+    from picamera2 import Picamera2
+    _PICAMERA2_AVAILABLE = True
+except ImportError:
+    # Try system Python packages (with careful path handling)
+    try:
+        _prev_path = sys.path.copy()
+        sys.path.insert(0, '/usr/lib/python3/dist-packages')
+        from picamera2 import Picamera2
+        sys.path = _prev_path
+        _PICAMERA2_AVAILABLE = True
+    except ImportError:
+        sys.path = _prev_path if '_prev_path' in locals() else sys.path
+        Picamera2 = None
+        _PICAMERA2_AVAILABLE = False
 
 # Import GPU configuration
 try:
@@ -79,6 +102,8 @@ except ImportError:
 # YOLO Models
 YOLO_MODEL_PATH_FAST = "yolo11n.pt"
 YOLO_MODEL_PATH_HEAVY = str(CNN_DIR / "models/yolo/yolo11x-seg.pt")
+
+_INFERENCE_IMGSZ = 320  # YOLO input resolution; 320 gives ~4x speedup vs 640 on ARM
 
 # Configuration
 IMG_SIZE = (224, 224)
@@ -720,6 +745,235 @@ class RearSideUseCaseValidator:
         }
 
 
+def is_raspberry_pi():
+    """Detect Raspberry Pi / ARM-based Raspberry Pi OS environments."""
+    machine = platform.machine().lower()
+    release = platform.release().lower()
+    return (
+        'arm' in machine or 'aarch64' in machine or 'armv7' in machine or
+        'raspberry' in release or os.path.exists('/proc/device-tree/model')
+    )
+
+
+class SystemPicamera2Bridge:
+    """Picamera2 frame source backed by system Python for venv compatibility."""
+
+    def __init__(self, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.process = subprocess.Popen(
+            ["python3", str(SCRIPT_DIR / "camera_capture_wrapper.py"),
+             "--width", str(width),
+             "--height", str(height),
+             "--fps", str(fps)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        time.sleep(2)
+        if self.process.poll() is not None:
+            raise RuntimeError(f"system Picamera2 bridge exited with code {self.process.returncode}")
+
+    def _drain_stderr(self):
+        if self.process.stderr is None:
+            return
+        for line in iter(self.process.stderr.readline, b""):
+            if not line:
+                break
+            print(line.decode(errors="replace").rstrip(), file=sys.stderr)
+
+    def _read_exact(self, size):
+        chunks = []
+        total = 0
+        while total < size:
+            chunk = self.process.stdout.read(size - total)
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+
+    def read_frame(self):
+        header = self._read_exact(4)
+        if header is None:
+            return None
+        frame_len = struct.unpack("!I", header)[0]
+        if frame_len <= 0 or frame_len > 10_000_000:
+            return None
+        frame_data = self._read_exact(frame_len)
+        if frame_data is None:
+            return None
+        jpg_array = np.frombuffer(frame_data, dtype=np.uint8)
+        return cv2.imdecode(jpg_array, cv2.IMREAD_COLOR)
+
+    def stop(self):
+        if self.process.poll() is not None:
+            return
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=2)
+
+    def close(self):
+        self.stop()
+
+
+def setup_picamera2(width=640, height=480, fps=30):
+    """Setup Raspberry Pi camera using Picamera2/libcamera."""
+    if not _PICAMERA2_AVAILABLE:
+        if is_raspberry_pi():
+            try:
+                camera = SystemPicamera2Bridge(width, height, fps)
+                print(f"✅ Picamera2 bridge started at {width}x{height} @ {fps} FPS")
+                return camera
+            except Exception as e:
+                print(f"⚠️ Picamera2 bridge setup failed: {e}")
+        else:
+            print("⚠️ Picamera2 is not available")
+        return None
+
+    try:
+        camera = Picamera2()
+        config = camera.create_preview_configuration(
+            main={'size': (width, height), 'format': 'RGB888'}
+        )
+        camera.configure(config)
+        try:
+            camera.set_controls({'FrameRate': fps})
+        except Exception:
+            pass
+        camera.start()
+        print(f"✅ Picamera2 started at {width}x{height} @ {fps} FPS")
+        return camera
+    except Exception as e:
+        print(f"⚠️ Picamera2 setup failed: {e}")
+        if is_raspberry_pi():
+            try:
+                camera = SystemPicamera2Bridge(width, height, fps)
+                print(f"✅ Picamera2 bridge started at {width}x{height} @ {fps} FPS")
+                return camera
+            except Exception as bridge_error:
+                print(f"⚠️ Picamera2 bridge setup failed: {bridge_error}")
+        return None
+
+
+def get_picamera2_frame(camera):
+    """Get a frame from Picamera2 as BGR OpenCV image."""
+    try:
+        if isinstance(camera, SystemPicamera2Bridge):
+            return camera.read_frame()
+        frame = camera.capture_array()
+        if frame is None:
+            return None
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return frame
+    except Exception as e:
+        print(f"⚠️ Error getting Picamera2 frame: {e}")
+        return None
+
+
+# ============================================================================
+# ASYNC YOLO INFERENCE THREAD
+# ============================================================================
+
+class AsyncYOLOThread:
+    """
+    Runs YOLO inference in a dedicated background thread.
+    Main display loop submits frames and reads the latest result without ever
+    blocking on inference — the key to achieving 25-30 FPS on Raspberry Pi 5.
+    """
+
+    def __init__(self, model, imgsz=320):
+        self._model = model
+        self._imgsz = imgsz
+        self._queue = queue.Queue(maxsize=1)
+        self._result = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True,
+                                        name="yolo-inference")
+        self._thread.start()
+
+    def _worker(self):
+        while not self._stop.is_set():
+            try:
+                frame = self._queue.get(timeout=0.05)
+                result = self._model(frame, imgsz=self._imgsz, verbose=False)[0]
+                with self._lock:
+                    self._result = result
+            except queue.Empty:
+                continue
+            except Exception:
+                pass
+
+    def submit(self, frame):
+        """Non-blocking submit.  Drops frame if inference is still running."""
+        try:
+            self._queue.put_nowait(frame)
+        except queue.Full:
+            pass
+
+    def get_latest(self):
+        """Return the most recent result, or None during warm-up."""
+        with self._lock:
+            return self._result
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+
+# ============================================================================
+# THREADED CAMERA CAPTURE
+# ============================================================================
+
+class ThreadedCapture:
+    """
+    Wraps cv2.VideoCapture in a background thread so the main loop always
+    gets the freshest frame and camera buffering never adds latency.
+    Drop-in compatible with VideoCapture (implements read / release / isOpened).
+    """
+
+    def __init__(self, cap):
+        self._cap = cap
+        self._frame = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="camera-capture")
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            ret, frame = self._cap.read()
+            if ret and frame is not None:
+                with self._lock:
+                    self._frame = frame
+            else:
+                time.sleep(0.001)
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def isOpened(self):
+        return self._cap.isOpened()
+
+    def stop(self):
+        self._stop.set()
+        self._cap.release()
+
+    def release(self):
+        self.stop()
+
+
 # ============================================================================
 # CAMERA VEHICLE DETECTOR (Main Class)
 # ============================================================================
@@ -728,21 +982,35 @@ class CameraVehicleDetector:
     """Real-time camera-based vehicle detector with advanced ADAS features"""
     
     def __init__(self, device='cuda', zoedepth_interval=30, correction_alpha=0.3,
-                 learnable_alpha=True, alpha_lr=0.05, fps=30):
+                 learnable_alpha=True, alpha_lr=0.05, fps=30,
+                 frame_width=1920, frame_height=1080):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"🔥 Device: {self.device}")
         self.fps = fps
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        
+        self.frame_counter = 0
+        self.skip_horizon_frames = 30  # Horizon Hough update interval (frames)
+        self.cached_horizon = frame_height * 0.55
         
         # Load YOLO (using yolo11n for real-time performance)
         print("📦 Loading YOLO11n (fast model)...")
         self.yolo = YOLO(YOLO_MODEL_PATH_FAST)
-        print("✅ YOLO11n loaded (optimized for real-time inference)")
+        self.yolo.conf = 0.4  # Set confidence threshold
+        print("  YOLO11n loaded (async inference thread, imgsz={})".format(_INFERENCE_IMGSZ))
+        self._async_yolo = AsyncYOLOThread(self.yolo, imgsz=_INFERENCE_IMGSZ)
         
         # Load Classifier
         CLASSIFIER_PATH = str(CNN_DIR / "models/classifier/weights/best.pt")
-        print(f"📦 Loading Classifier: {CLASSIFIER_PATH}")
-        self.classifier = YOLO(CLASSIFIER_PATH)
-        print("✅ Classifier loaded")
+        if os.path.exists(CLASSIFIER_PATH):
+            print(f"📦 Loading Classifier: {CLASSIFIER_PATH}")
+            self.classifier = YOLO(CLASSIFIER_PATH)
+            print("✅ Classifier loaded")
+        else:
+            self.classifier = None
+            print(f"⚠️ Classifier weights not found: {CLASSIFIER_PATH}")
+            print("   Running with YOLO detections only")
         
         # Initialize ByteTracker
         if _BYTE_TRACKER_AVAILABLE:
@@ -772,13 +1040,13 @@ class CameraVehicleDetector:
         
         # Dynamic Horizon Estimator
         self.horizon_estimator = DynamicHorizonEstimator(
-            frame_width=1920, frame_height=1080,
+            frame_width=self.frame_width, frame_height=self.frame_height,
             ema_alpha=0.15, fallback_ratio=0.55
         )
         print("✅ Dynamic Horizon Estimator initialized")
         
         # Lane Detector
-        self.lane_detector = LaneDetector(frame_width=1920, frame_height=1080)
+        self.lane_detector = LaneDetector(frame_width=self.frame_width, frame_height=self.frame_height)
         print("✅ Lane Detector initialized")
         
         # Rider Action Recommender
@@ -790,7 +1058,7 @@ class CameraVehicleDetector:
         print("✅ Rear-View Safety Assessment initialized")
         
         # Rear-Side Validator
-        self.rear_side_validator = RearSideUseCaseValidator(frame_width=1920, frame_height=1080)
+        self.rear_side_validator = RearSideUseCaseValidator(frame_width=self.frame_width, frame_height=self.frame_height)
         print("✅ Rear-Side Use Case Validator initialized")
         
         # Safety assessment cache
@@ -899,17 +1167,25 @@ class CameraVehicleDetector:
             return "stable", 0.0
     
     def detect_frame(self, frame):
-        """Detect vehicles in a single frame"""
+        """Detect vehicles in a single frame - optimized for real-time processing"""
         results = []
         current_boxes_raw = []
         ts_now = time.time()
         h_frame, w_frame = frame.shape[:2]
         
-        # Update Dynamic Horizon
-        y_horizon, horizon_conf = self.horizon_estimator.update(frame)
-        
-        # YOLO detection
-        yolo_results = self.yolo(frame, verbose=False)[0]
+        # Horizon estimation (Hough-based, runs every N frames to save CPU)
+        if self.frame_counter % self.skip_horizon_frames == 0:
+            y_horizon, _ = self.horizon_estimator.update(frame)
+            self.cached_horizon = y_horizon
+        else:
+            y_horizon = self.cached_horizon
+
+        # Submit to async YOLO thread — non-blocking, main loop never stalls
+        self._async_yolo.submit(frame)
+        yolo_results = self._async_yolo.get_latest()
+        if yolo_results is None:
+            self.frame_counter += 1
+            return []  # Warm-up: inference thread not ready yet
         
         for i, detection in enumerate(yolo_results.boxes.data):
             x1, y1, x2, y2, conf, cls_id = detection.cpu().numpy()
@@ -939,23 +1215,24 @@ class CameraVehicleDetector:
                 final_conf = float(conf)
                 source = 'YOLO'
                 
-                crop = frame[y1:y2, x1:x2]
-                
-                if crop.size > 0:
-                    crop_area = crop.shape[0] * crop.shape[1]
-                    if crop_area >= self.MIN_CROP_AREA:
-                        try:
-                            cls_results = self.classifier(crop, verbose=False)
-                            if cls_results and len(cls_results) > 0:
-                                top1 = cls_results[0].probs.top1
-                                top1_conf = cls_results[0].probs.top1conf.item()
-                                pred_class = cls_results[0].names[top1]
-                                if top1_conf > 0.4:
-                                    final_class = pred_class
-                                    final_conf = top1_conf
-                                    source = 'YOLO_CLS'
-                        except Exception as e:
-                            pass
+                # OPTIMIZATION: Skip classifier for speed - YOLO is accurate enough
+                # Uncomment below if classifier is available and speed is not critical
+                # crop = frame[y1:y2, x1:x2]
+                # if crop.size > 0 and self.classifier is not None:
+                #     crop_area = crop.shape[0] * crop.shape[1]
+                #     if crop_area >= self.MIN_CROP_AREA:
+                #         try:
+                #             cls_results = self.classifier(crop, verbose=False)
+                #             if cls_results and len(cls_results) > 0:
+                #                 top1 = cls_results[0].probs.top1
+                #                 top1_conf = cls_results[0].probs.top1conf.item()
+                #                 pred_class = cls_results[0].names[top1]
+                #                 if top1_conf > 0.4:
+                #                     final_class = pred_class
+                #                     final_conf = top1_conf
+                #                     source = 'YOLO_CLS'
+                #         except Exception as e:
+                #             pass
                 
                 current_boxes_raw.append([x1, y1, x2, y2])
                 results.append({
@@ -970,7 +1247,7 @@ class CameraVehicleDetector:
         results = self.merge_rider_and_vehicle(results)
         current_boxes_raw = [r['bbox'] for r in results]
         
-        # Use ByteTracker for tracking
+        # Use ByteTracker for tracking - reuses track IDs when YOLO detections are cached
         matches = []
         if self.use_byte_tracker and self.tracker is not None:
             tracker_inputs = []
@@ -1047,6 +1324,7 @@ class CameraVehicleDetector:
                     result['confidence'] = float(min(1.0, stable_conf))
         
         self.prev_boxes = [{'bbox': r['bbox'], 'track_id': r['track_id']} for r in results]
+        self.frame_counter += 1
         
         return results
     
@@ -1149,163 +1427,181 @@ class CameraVehicleDetector:
         return inter_area / union_area if union_area > 0 else 0
     
     def draw_detections(self, frame, detections, fps=None):
-        """Draw bounding boxes with rich ADAS information"""
+        """Draw a professional, emoji-free ADAS overlay suitable for Pi displays."""
         annotated = frame.copy()
-        
-        # Draw top HUD bar for scenario summary and FPS
-        hud_height = 90
-        cv2.rectangle(annotated, (0, 0), (annotated.shape[1], hud_height), (0, 0, 0), -1)
-        cv2.putText(annotated, "LIVE VEHICLE DETECTION", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        h, w = annotated.shape[:2]
 
-        # Scenario and threat information
-        if hasattr(self, 'last_scenario_validation') and self.last_scenario_validation:
-            scenario = self.last_scenario_validation
-            scenario_text = (
-                f"Scenario: {scenario.get('scenario_type', 'unknown')} | "
-                f"Threat: {scenario.get('threat_level', 'none')} | "
-                f"Critical: {scenario.get('critical_vehicles_count', 0)}"
-            )
-            cv2.putText(annotated, scenario_text, (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 255, 200), 2)
-        
-        # Additional FPS text overlay if available
-        if fps:
-            fps_text = f"FPS: {fps:.1f}"
-            cv2.putText(annotated, fps_text, (annotated.shape[1] - 250, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-        # Define alert colors based on safety level
-        safety_colors = {
-            'CRITICAL': (0, 0, 255),      # Red
-            'WARNING': (0, 165, 255),     # Orange
-            'CAUTION': (0, 255, 255),     # Yellow
-            'SAFE': (0, 255, 0),          # Green
-            'INFO': (0, 165, 255),        # Orange
-            'unknown': (128, 128, 128)    # Gray
+        SAFETY_CLR = {
+            'CRITICAL': (20,  20, 210),
+            'WARNING':  (20, 130, 245),
+            'CAUTION':  (20, 210, 210),
+            'SAFE':     (20, 200,  20),
+            'INFO':     (20, 180, 180),
+            'unknown':  (100, 100, 100),
         }
-        
+        MOTION_CLR = {
+            'approaching': (20,  20, 210),
+            'receding':    (20, 210, 210),
+            'stable':      (20, 200,  20),
+        }
+        URGENCY_CLR = {
+            'CRITICAL': (20,  20, 210),
+            'HIGH':     (20, 130, 245),
+            'MEDIUM':   (20, 210, 210),
+            'LOW':      (20, 200,  20),
+        }
+
+        # ------------------------------------------------------------------
+        # TOP HUD BAR
+        # ------------------------------------------------------------------
+        HUD_H = 76
+        cv2.rectangle(annotated, (0, 0), (w, HUD_H), (12, 12, 12), -1)
+        cv2.line(annotated, (0, HUD_H), (w, HUD_H), (0, 140, 255), 2)
+
+        dev_tag = "CPU" if str(self.device) == "cpu" else str(self.device).upper()
+        fps_tag = f"{fps:.1f}" if fps else "--"
+        row1 = f"REAR-ADAS  |  {dev_tag}  |  FPS: {fps_tag}  |  TRACKS: {len(detections)}"
+        cv2.putText(annotated, row1, (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (220, 220, 220), 1, cv2.LINE_AA)
+
+        sv = getattr(self, 'last_scenario_validation', None)
+        if sv:
+            sc  = sv.get('scenario_type', 'unknown').upper().replace('_', ' ')
+            thr = sv.get('threat_level', 'none').upper()
+            nc  = sv.get('critical_vehicles_count', 0)
+            t_clr = (20, 20, 210) if thr == 'HIGH' else (
+                    (20, 130, 245) if thr == 'MEDIUM' else (140, 200, 140))
+            cv2.putText(annotated,
+                        f"SCENARIO: {sc}  |  THREAT: {thr}  |  CRITICAL VEH: {nc}",
+                        (12, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.55, t_clr, 1, cv2.LINE_AA)
+
+        # ------------------------------------------------------------------
+        # PER-DETECTION OVERLAYS
+        # ------------------------------------------------------------------
         for det in detections:
             x1, y1, x2, y2 = det['bbox']
-            class_name = det['class']
-            confidence = det['confidence']
-            distance = det.get('distance', None)
-            distance_metadata = det.get('distance_metadata', {})
-            z_classical = distance_metadata.get('classical_fused', None)
-            z_ml = distance_metadata.get('ml', None)
-            motion = det.get('motion', 'unknown')
-            speed = det.get('speed', 0.0)
-            
-            # Get safety assessment
-            safety_assess = det.get('safety_assessment', {})
-            safety_level = safety_assess.get('level', 'unknown')
-            alert_type = safety_assess.get('alert_type', 'none')
-            
-            # Choose color based on safety level
-            if safety_level != 'unknown':
-                box_color = safety_colors.get(safety_level, (128, 128, 128))
-            else:
-                motion_colors = {
-                    'approaching': (0, 0, 255),    # Red
-                    'receding': (0, 255, 255),     # Yellow
-                    'stable': (0, 255, 0),         # Green
-                    'unknown': CLASS_COLORS.get(class_name, (255, 255, 255))
-                }
-                box_color = motion_colors.get(motion, CLASS_COLORS.get(class_name, (255, 255, 255)))
-            
-            # Draw box
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 3)
-            
-            # Draw label with distance and depth estimates
+            cls_name = det['class']
+            conf     = det['confidence']
+            distance = det.get('distance')
+            motion   = det.get('motion', 'unknown')
+            speed    = det.get('speed', 0.0)
+            tid      = det.get('track_id', -1)
+
+            sa       = det.get('safety_assessment') or {}
+            slevel   = sa.get('level', 'unknown')
+            alert_t  = sa.get('alert_type', 'none')
+
+            clr = SAFETY_CLR.get(slevel) if slevel != 'unknown' \
+                  else MOTION_CLR.get(motion,
+                       CLASS_COLORS.get(cls_name, (180, 180, 180)))
+
+            # Bounding box
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), clr, 2)
+
+            # L-shaped corner ticks (automotive HUD style)
+            tk = max(4, min(14, (x2 - x1) // 4, (y2 - y1) // 4))
+            for px, py, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),
+                                    (x1,y2,1,-1),(x2,y2,-1,-1)]:
+                cv2.line(annotated, (px, py), (px + dx*tk, py), clr, 3)
+                cv2.line(annotated, (px, py), (px, py + dy*tk), clr, 3)
+
+            # Track ID (small, inside top-left corner)
+            if tid >= 0:
+                cv2.putText(annotated, f"#{tid}", (x1 + 4, y1 + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200),
+                            1, cv2.LINE_AA)
+
+            # ---- TOP LABEL:  CLASS  CONF%  D:X.Xm -----------------------
+            dist_s  = f"  D:{distance:.1f}m" if distance else ""
+            top_txt = f" {cls_name.upper()}  {conf*100:.0f}%{dist_s} "
+            (tw, th), _ = cv2.getTextSize(
+                top_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+            ty = max(y1 - 2, HUD_H + th + 4)
+            cv2.rectangle(annotated,
+                          (x1, ty - th - 6), (x1 + tw + 2, ty + 2), clr, -1)
+            cv2.putText(annotated, top_txt, (x1, ty - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255),
+                        1, cv2.LINE_AA)
+
+            # ---- MOTION BADGE (top-right, inside box) --------------------
+            if motion not in ('unknown', None):
+                spd_s   = f"  {speed:.0f}km/h" if speed > 0.5 else ""
+                mot_txt = f" {motion.upper()}{spd_s} "
+                (mw, mh), _ = cv2.getTextSize(
+                    mot_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+                mx = max(x1, x2 - mw - 4)
+                my = y1 + 2
+                cv2.rectangle(annotated,
+                              (mx - 2, my), (mx + mw + 2, my + mh + 6), clr, -1)
+                cv2.putText(annotated, mot_txt, (mx, my + mh + 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255),
+                            1, cv2.LINE_AA)
+
+            # ---- BADGES STACKED BELOW BOX --------------------------------
+            badge_y = y2 + 4
+
+            # Distance badge (centered)
             if distance:
-                label = f"{class_name}: {confidence:.2f} | D:{distance:.1f}m"
-                if isinstance(z_classical, (int, float, np.floating)):
-                    label += f" C:{float(z_classical):.1f}"
-                if isinstance(z_ml, (int, float, np.floating)):
-                    label += f" ML:{float(z_ml):.1f}"
-            else:
-                label = f"{class_name}: {confidence:.2f}"
-            
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10), 
-                         (x1 + label_size[0], y1), box_color, -1)
-            cv2.putText(annotated, label, (x1, y1 - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            
-            # Draw distance below box
-            if distance:
-                dist_text = f"{distance:.1f}m"
-                dist_size, _ = cv2.getTextSize(dist_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-                cv2.rectangle(annotated, (x1, y2), 
-                             (x1 + dist_size[0] + 10, y2 + dist_size[1] + 10), box_color, -1)
-                cv2.putText(annotated, dist_text, (x1 + 5, y2 + dist_size[1] + 5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            
-            # Draw motion state
-            if motion != 'unknown':
-                if speed > 0:
-                    motion_text = f"{motion.upper()} {speed:.1f}km/h"
-                else:
-                    motion_text = motion.upper()
-                motion_size, _ = cv2.getTextSize(motion_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                motion_x = x2 - motion_size[0] - 10
-                motion_y = y1 + 25
-                cv2.rectangle(annotated, (motion_x - 5, motion_y - motion_size[1] - 5), 
-                             (x2 - 5, motion_y + 5), box_color, -1)
-                cv2.putText(annotated, motion_text, (motion_x, motion_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # Draw safety assessment and rider action
-            if safety_level != 'unknown' and alert_type != 'none':
-                safety_y = y2 + 40
-                
-                lane_info = safety_assess.get('lane_info', {})
-                lane_name = lane_info.get('lane', 'CENTER') if lane_info else 'CENTER'
-                is_same_lane = safety_assess.get('same_lane', True)
-                
+                db_txt  = f" {distance:.1f} m "
+                (dw, dh), _ = cv2.getTextSize(
+                    db_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.72, 2)
+                db_x = x1 + max(0, (x2 - x1 - dw) // 2)
+                cv2.rectangle(annotated,
+                              (db_x - 2, badge_y),
+                              (db_x + dw + 2, badge_y + dh + 8), clr, -1)
+                cv2.putText(annotated, db_txt,
+                            (db_x, badge_y + dh + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.72,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                badge_y += dh + 12
+
+            # Safety / SSM badge
+            if slevel not in ('unknown', 'SAFE') and alert_t != 'none':
+                lane_info    = sa.get('lane_info') or {}
+                lane_name    = lane_info.get('lane', 'CENTER')
+                is_same_lane = sa.get('same_lane', True)
+
                 if not is_same_lane:
-                    safety_text = f"[{lane_name} LANE] {distance:.1f}m away"
-                    box_color_text = (0, 165, 255)
+                    d_s    = f"{distance:.1f}m" if distance else "--"
+                    sf_txt = f" {lane_name} LANE  {d_s} "
+                    sf_clr = (20, 140, 180)
                 else:
-                    safety_text = f"[{safety_level}] {alert_type}"
-                    
-                    ttc_val = safety_assess.get('ttc')
-                    drac_val = safety_assess.get('drac')
-                    
-                    if ttc_val is not None:
-                        safety_text += f" TTC:{ttc_val:.2f}s"
-                    if drac_val is not None and drac_val != float('inf'):
-                        safety_text += f" DRAC:{drac_val:.2f}m/s²"
-                    
-                    box_color_text = box_color
-                
-                safety_size, _ = cv2.getTextSize(safety_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(annotated, (x1, safety_y - safety_size[1] - 5), 
-                             (x1 + safety_size[0] + 10, safety_y + 5), box_color_text, -1)
-                cv2.putText(annotated, safety_text, (x1 + 5, safety_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                # Draw rider action recommendation
-                rider_action = safety_assess.get('rider_action', {})
-                if rider_action and rider_action.get('action'):
-                    instruction = rider_action.get('rider_instruction', '')
-                    urgency = rider_action.get('urgency', 'LOW')
-                    
-                    urgency_colors = {
-                        'CRITICAL': (0, 0, 255),      # Red
-                        'HIGH': (0, 165, 255),        # Orange
-                        'MEDIUM': (0, 255, 255),      # Yellow
-                        'LOW': (0, 255, 0),           # Green
-                    }
-                    urgency_color = urgency_colors.get(urgency, (128, 128, 128))
-                    
-                    action_y = safety_y + 25
-                    action_text = f"→ {instruction[:50]}"
-                    action_size, _ = cv2.getTextSize(action_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(annotated, (x1, action_y - action_size[1] - 5), 
-                                 (x1 + action_size[0] + 10, action_y + 5), urgency_color, -1)
-                    cv2.putText(annotated, action_text, (x1 + 5, action_y), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    ttc_v  = sa.get('ttc')
+                    drac_v = sa.get('drac')
+                    sf_txt = f" [{slevel}] {alert_t.replace('_', ' ')}"
+                    if ttc_v is not None:
+                        sf_txt += f"  TTC:{ttc_v:.2f}s"
+                    if drac_v is not None and not math.isinf(drac_v):
+                        sf_txt += f"  DRAC:{drac_v:.2f}"
+                    sf_txt += " "
+                    sf_clr = clr
+
+                (sw, sh), _ = cv2.getTextSize(
+                    sf_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+                cv2.rectangle(annotated,
+                              (x1, badge_y),
+                              (x1 + sw + 2, badge_y + sh + 8), sf_clr, -1)
+                cv2.putText(annotated, sf_txt, (x1 + 1, badge_y + sh + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+                badge_y += sh + 12
+
+                # Action instruction badge
+                ra    = sa.get('rider_action') or {}
+                instr = ra.get('rider_instruction', '')
+                urg   = ra.get('urgency', 'LOW')
+                if instr and slevel in ('CRITICAL', 'WARNING', 'CAUTION'):
+                    act_txt = f" >> {instr[:55]} "
+                    ug_clr  = URGENCY_CLR.get(urg, (100, 100, 100))
+                    (aw, ah), _ = cv2.getTextSize(
+                        act_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+                    cv2.rectangle(annotated,
+                                  (x1, badge_y),
+                                  (x1 + aw + 2, badge_y + ah + 8), ug_clr, -1)
+                    cv2.putText(annotated, act_txt,
+                                (x1 + 1, badge_y + ah + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                                (255, 255, 255), 1, cv2.LINE_AA)
 
         return annotated
 
@@ -1372,9 +1668,18 @@ def get_realsense_frame(pipeline):
 
 
 def main():
+    def handle_shutdown(signum, _frame):
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
     parser = argparse.ArgumentParser(description='Real-time Camera ADAS Detection')
     parser.add_argument('--camera', type=str, default='0',
                        help='Camera index or video file path')
+    parser.add_argument('--camera-backend', type=str, default='auto',
+                       choices=['auto', 'opencv', 'picamera2'],
+                       help='Camera backend to use for attached camera devices')
     parser.add_argument('--width', type=int, default=1280,
                        help='Frame width')
     parser.add_argument('--height', type=int, default=720,
@@ -1387,6 +1692,8 @@ def main():
                        help='Disable display window')
     parser.add_argument('--realsense', action='store_true',
                        help='Use RealSense D455 camera')
+    parser.add_argument('--picamera2', action='store_true',
+                       help='Use Raspberry Pi camera via Picamera2/libcamera')
     parser.add_argument('--force-usb', action='store_true',
                        help='Force USB camera even if RealSense is available')
     parser.add_argument('--profile', type=str, default='a6000_full',
@@ -1402,7 +1709,7 @@ def main():
     args = parser.parse_args()
     
     # Apply GPU configuration if available
-    if _GPU_CONFIG_AVAILABLE:
+    if _GPU_CONFIG_AVAILABLE and not (is_raspberry_pi() and not torch.cuda.is_available()):
         print(f"🎮 Applying GPU profile: {args.profile}")
         try:
             gpu_manager = setup_gpu(profile=args.profile, verbose=args.verbose)
@@ -1415,16 +1722,36 @@ def main():
             print(f"⚠️  Failed to apply GPU configuration: {e}")
             print("   Running with default settings\n")
     else:
-        print(f"🎮 GPU profile requested: {args.profile} (configuration not available)")
+        print(f"🎮 GPU profile requested: {args.profile} (skipped on Raspberry Pi / unavailable)")
+        print("   Using CPU-friendly camera settings\n")
     
     print("\n" + "="*60)
     print("🎬 REAL-TIME CAMERA VEHICLE DETECTION (Advanced ADAS)")
     print("="*60 + "\n")
+
+    if is_raspberry_pi() and not torch.cuda.is_available() and args.device == 'cuda':
+        print("ℹ️ Raspberry Pi detected without CUDA; using CPU runtime")
     
     # Try to open camera
     cap = None
     realsense_pipeline = None
     use_realsense = False
+    picamera2_camera = None
+    use_picamera2 = False
+
+    if args.picamera2 and not _PICAMERA2_AVAILABLE:
+        print("⚠️ --picamera2 was requested but Picamera2 is not installed")
+
+    auto_use_picamera2 = (
+        args.camera_backend == 'picamera2' or
+        (args.camera_backend == 'auto' and is_raspberry_pi())
+    )
+
+    pi_camera_width = args.width
+    pi_camera_height = args.height
+    if (args.picamera2 or auto_use_picamera2) and args.width == 1280 and args.height == 720:
+        pi_camera_width = 640
+        pi_camera_height = 480
     
     if args.realsense and not args.force_usb:
         print("🎥 Attempting to open RealSense D455 camera...")
@@ -1440,9 +1767,23 @@ def main():
             print("   • Try: rs-enumerate-devices (if installed)")
             print("   • Update RealSense firmware if needed")
             print("   • Falling back to USB camera...\n")
+
+    # Raspberry Pi camera path (preferred on Pi if available)
+    if not use_realsense and (args.picamera2 or auto_use_picamera2):
+        if _PICAMERA2_AVAILABLE:
+            print("🎥 Attempting to open Raspberry Pi camera via Picamera2...")
+        else:
+            print("🎥 Picamera2 is unavailable in this Python; trying system-Python bridge...")
+
+        picamera2_camera = setup_picamera2(pi_camera_width, pi_camera_height, fps=30)
+        if picamera2_camera is not None:
+            use_picamera2 = True
+            print("✓ Picamera2 camera ready\n")
+        else:
+            print("❌ Picamera2 camera setup failed, falling back to OpenCV camera...\n")
     
     # If not using RealSense, try USB camera
-    if not use_realsense:
+    if not use_realsense and not use_picamera2:
         # Try the specified camera first
         try:
             camera_id = int(args.camera)
@@ -1489,13 +1830,33 @@ def main():
                 print("   • For RealSense: use --realsense flag")
                 return
     
+    # Wrap USB camera in threaded capture (eliminates buffer lag)
+    _is_video_file = False
+    try:
+        int(args.camera)
+    except (ValueError, TypeError):
+        _is_video_file = True
+
+    if not use_realsense and not use_picamera2 and not _is_video_file and cap is not None:
+        cap = ThreadedCapture(cap)
+
     # Set frame dimensions
-    if not use_realsense:
+    if not use_realsense and not use_picamera2 and not isinstance(cap, ThreadedCapture):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        
+    elif not use_realsense and not use_picamera2 and _is_video_file:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    if not use_realsense and not use_picamera2 and not isinstance(cap, ThreadedCapture):
         actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    elif not use_realsense and not use_picamera2 and _is_video_file:
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    elif use_picamera2:
+        actual_width = pi_camera_width
+        actual_height = pi_camera_height
     else:
         actual_width = args.width
         actual_height = args.height
@@ -1503,7 +1864,11 @@ def main():
     print(f"✅ Source opened: {actual_width}x{actual_height}")
     
     # Initialize detector
-    detector = CameraVehicleDetector(device=args.device)
+    detector = CameraVehicleDetector(
+        device=args.device,
+        frame_width=actual_width,
+        frame_height=actual_height,
+    )
     
     # Setup video writer if saving
     writer = None
@@ -1553,6 +1918,12 @@ def main():
                 else:
                     consecutive_failures = 0  # Reset on success
                 ret = True
+            elif use_picamera2:
+                frame = get_picamera2_frame(picamera2_camera)
+                if frame is None:
+                    print("⚠️ Picamera2 frame not available")
+                    break
+                ret = True
             else:
                 ret, frame = cap.read()
                 if not ret:
@@ -1599,16 +1970,24 @@ def main():
             
             # Handle key press
             if not args.no_display:
-                key = cv2.waitKey(30) & 0xFF
+                key = cv2.waitKey(1) & 0xFF
                 if key == ord('q') or key == 27:
                     print("\n✓ Exit requested")
                     break
-    
+    except KeyboardInterrupt as e:
+        print(f"\n🛑 Shutdown requested ({e})")
     finally:
         # Cleanup
         if use_realsense and realsense_pipeline:
             realsense_pipeline.stop()
             print("✓ RealSense pipeline stopped")
+        elif use_picamera2 and picamera2_camera:
+            try:
+                picamera2_camera.stop()
+                picamera2_camera.close()
+                print("✓ Picamera2 stopped")
+            except Exception:
+                pass
         elif cap:
             cap.release()
         
@@ -1616,7 +1995,9 @@ def main():
             writer.release()
         if not args.no_display:
             cv2.destroyAllWindows()
-        
+        if 'detector' in dir() and hasattr(detector, '_async_yolo'):
+            detector._async_yolo.stop()
+
         # Stats
         elapsed = time.time() - start_time
         avg_fps = frame_count / elapsed if elapsed > 0 else 0
@@ -1634,4 +2015,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

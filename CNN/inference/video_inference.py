@@ -1820,13 +1820,17 @@ class VideoDetector:
         current_boxes_raw = []
         ts_now = time.time()
         
-        # === UPDATE DYNAMIC HORIZON (adapts to suspension movement) ===
-        y_horizon, horizon_conf = self.horizon_estimator.update(frame)
-        if horizon_conf > 0.3:
-            print(f"  🌍 Horizon: y={y_horizon:.1f}px (conf={horizon_conf:.2f})")
+        # Horizon update every 15 frames (Hough transform is expensive)
+        if not hasattr(self, '_horizon_frame_ctr'):
+            self._horizon_frame_ctr = 0
+        self._horizon_frame_ctr += 1
+        if self._horizon_frame_ctr % 15 == 0:
+            y_horizon, _ = self.horizon_estimator.update(frame)
+        else:
+            y_horizon = self.horizon_estimator.get_horizon()
         
         # YOLO detection
-        yolo_results = self.yolo(frame, verbose=False)[0]
+        yolo_results = self.yolo(frame, imgsz=320, verbose=False)[0]
         for i, detection in enumerate(yolo_results.boxes.data):
             x1, y1, x2, y2, conf, cls_id = detection.cpu().numpy()
             cls_id = int(cls_id)
@@ -1855,7 +1859,7 @@ class VideoDetector:
                     crop_area = crop.shape[0] * crop.shape[1]
                     if crop_area >= self.MIN_CROP_AREA:
                         try:
-                            cls_results = self.classifier(crop, verbose=False)
+                            cls_results = self.classifier(crop, imgsz=224, verbose=False)
                             if cls_results and len(cls_results) > 0:
                                 top1 = cls_results[0].probs.top1
                                 top1_conf = cls_results[0].probs.top1conf.item()
